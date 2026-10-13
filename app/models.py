@@ -1,0 +1,70 @@
+"""Pydantic models for the HTTP API."""
+
+from __future__ import annotations
+
+from pydantic import BaseModel, Field
+
+
+class TaskCreateRequest(BaseModel):
+    """Body of POST /task."""
+
+    task: str = Field(min_length=1, max_length=4000)
+
+
+class TaskCreateResponse(BaseModel):
+    """Acknowledgement that a task was stored and either started or refused."""
+
+    task_id: int
+    status: str
+    reason: str | None = None
+
+
+class ActionView(BaseModel):
+    """One recorded browser or safety action."""
+
+    id: int
+    action: str
+    details: str | None
+    timestamp: str
+
+
+class TaskStatusResponse(BaseModel):
+    """Body of GET /task/{id}."""
+
+    status: str
+    result: str | None = None
+    actions: list[ActionView] = Field(default_factory=list)
+
+
+class TaskSummary(BaseModel):
+    """One row in the task history list."""
+
+    id: int
+    task: str
+    status: str
+    created_at: str
+    finished_at: str | None = None
+    result: str | None = None
+
+
+class HealthResponse(BaseModel):
+    """Body of GET /health."""
+
+    status: str
+    ollama: str
+    model: str
+
+
+class ShellRequest(BaseModel):
+    """Body of POST /shell."""
+
+    command: str = Field(min_length=1, max_length=500)
+    confirm: bool = False
+
+
+class ShellResponse(BaseModel):
+    """Result of a shell tool call."""
+
+    status: str
+    output: str
+    reason: str | None = None
