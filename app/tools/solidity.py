@@ -14,6 +14,8 @@ from pathlib import Path
 
 import httpx
 
+from app.tools.functions import write_function_report
+
 _BLOCKSCOUT = "https://eth.blockscout.com/api/v2/smart-contracts/{address}"
 _SOURCE_SUFFIXES = (".sol", ".vy", ".yul")
 _MAX_FILE_BYTES = 1_500_000
@@ -46,6 +48,13 @@ class SavedSource:
             "",
         ]
         lines.extend(f"Saved file: {path}" for path in self.paths)
+        if any(path.endswith("/functions.txt") for path in self.paths):
+            lines.append("")
+            lines.append(
+                "functions.txt lists every function as read or write. "
+                "Address inputs are marked. No-argument read functions include the on-chain value, "
+                "and any returned address is listed at the bottom of that file."
+            )
         if self.implementation and self.implementation_paths:
             label = self.implementation_name or "implementation"
             lines.append("")
@@ -64,18 +73,31 @@ def save_verified_source(address: str, root: Path) -> SavedSource:
     implementation = _implementation_address(record)
     implementation_name: str | None = None
     implementation_paths: tuple[str, ...] = ()
+    impl_record: dict[str, object] | None = None
     if implementation and implementation.lower() != address.lower():
         try:
-            impl_record = _fetch(implementation)
-            impl_name = str(impl_record.get("name") or "Contract")
+            fetched = _fetch(implementation)
+            impl_name = str(fetched.get("name") or "Contract")
             implementation_paths = _write_files(
                 implementation,
-                _collect_files(impl_record, impl_name),
+                _collect_files(fetched, impl_name),
                 root,
             )
             implementation_name = impl_name
+            impl_record = fetched
         except SolidityError:
             implementation = None
+
+    report = write_function_report(
+        call_address=address,
+        abi_record=impl_record or record,
+        directory=root / "contracts" / address,
+        root=root,
+        contract_name=implementation_name or name,
+        implementation=implementation if impl_record is not None else None,
+    )
+    if report:
+        paths = paths + (report,)
 
     return SavedSource(
         address=address,

@@ -1,5 +1,5 @@
 name: etherscan-contract
-description: Read a verified Ethereum contract and save its Solidity files
+description: Read a verified Ethereum contract, save its Solidity, and list read and write functions
 args: address
 validate: address=ethereum
 fetch: solidity
@@ -23,7 +23,12 @@ Tasks:
    such as lib/.../IERC1967.sol.
 10. If the contract is a proxy, the implementation files are saved under
     contracts/<implementation address>/.
-11. In the result, list every saved path. Do not paste full source files.
+11. functions.txt in contracts/{address}/ lists every function as read or write.
+    Read means view or pure. Write means a transaction.
+    When an input is an address, the file marks that input.
+    When a no-argument read function returns an address, the file includes that address.
+12. In the result, list the saved paths and the addresses from functions.txt.
+    Do not paste full source files. Do not invent a function or an address.
 
 Do not invent any information.
 Do not connect a wallet or sign transactions.

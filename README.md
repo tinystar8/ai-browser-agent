@@ -36,7 +36,8 @@ ai-browser-agent/
 │   └── tools/
 │       ├── filesystem.py    Read-only files; opens SQLite .db as text
 │       ├── shell.py         Allowlisted commands
-│       └── solidity.py      Saves verified .sol files by their real names
+│       ├── solidity.py      Saves verified .sol files by their real names
+│       └── functions.py     Read/write function list and address values
 ├── skills/                  Prompt skills you can add
 ├── contracts/               Saved Solidity, one folder per address
 ├── prompt                   Send a prompt in plain text
@@ -157,6 +158,8 @@ Use a skill the same way. The first word is the skill name, and the rest are its
 ```
 
 That skill saves the verified Solidity before the browser opens. Each source file keeps its original name under `contracts/<address>/`, for example `contracts/<address>/lib/openzeppelin-contracts-v5/contracts/interfaces/IERC1967.sol`. A proxy also saves the implementation sources under `contracts/<implementation>/`.
+
+It also writes `contracts/<address>/functions.txt`. Each function is marked `read` or `write`. Address inputs are marked. Read functions that take no arguments include the value from Ethereum, and any returned address is listed at the bottom of that file. A proxy is read through the proxy, the same way Etherscan's Read as Proxy tab works.
 
 `./prompt --list` shows the skills that are installed.
 
