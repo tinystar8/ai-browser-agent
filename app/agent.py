@@ -20,6 +20,7 @@ from app.memory import MemoryStore, StoredTask
 from app.safety import assess_action
 from app.tools.filesystem import FilesystemError, inspect_path
 from app.tools.shell import execute as run_shell
+from app.tools.solidity import SolidityError, save_verified_source
 
 logger = logging.getLogger("ai_browser_agent")
 
@@ -306,6 +307,19 @@ def _build_tools(settings: Settings) -> Any | None:
         try:
             text = inspect_path(path, root)
         except FilesystemError as exc:
+            text = f"Refused: {exc}"
+        return ActionResult(extracted_content=text[:8000])
+
+    @tools.action(
+        "Download verified Ethereum mainnet Solidity for a 0x address and save each "
+        "source file under contracts/<address>/ using its original file name. "
+        "address is the contract address."
+    )
+    async def save_solidity_source(address: str) -> Any:
+        try:
+            saved = save_verified_source(address.strip(), root)
+            text = saved.note()
+        except SolidityError as exc:
             text = f"Refused: {exc}"
         return ActionResult(extracted_content=text[:8000])
 

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Send a prompt to the local browser agent.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+if [[ -x "$ROOT/.venv/bin/python" ]]; then
+  PY="$ROOT/.venv/bin/python"
+else
+  PY="${PYTHON:-python3}"
+fi
+
+exec "$PY" -m app.cli "$@"

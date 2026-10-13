@@ -6,9 +6,22 @@ from pydantic import BaseModel, Field
 
 
 class TaskCreateRequest(BaseModel):
-    """Body of POST /task."""
+    """Body of POST /task.
 
-    task: str = Field(min_length=1, max_length=4000)
+    Send a plain prompt in task, or a skill name plus the arguments that skill declares.
+    """
+
+    task: str | None = Field(default=None, max_length=8000)
+    skill: str | None = None
+    args: dict[str, str] = Field(default_factory=dict)
+
+
+class SkillView(BaseModel):
+    """One skill the caller can run."""
+
+    name: str
+    description: str
+    args: list[str] = Field(default_factory=list)
 
 
 class TaskCreateResponse(BaseModel):

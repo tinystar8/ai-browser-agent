@@ -24,8 +24,10 @@ The agent does not type passwords. Sign in yourself in the Chromium window it op
 ai-browser-agent/
 ├── app/
 │   ├── main.py              FastAPI routes
+│   ├── cli.py               ./prompt command
 │   ├── agent.py             Browser Use task runner
 │   ├── llm.py               LangChain client aimed at Ollama
+│   ├── skills.py            Loads skills/*.md
 │   ├── browser.py           Chromium profile and headless flag
 │   ├── memory.py            SQLite tasks, actions, JSON log
 │   ├── models.py            Request and response models
@@ -33,7 +35,11 @@ ai-browser-agent/
 │   ├── safety.py            Block rules
 │   └── tools/
 │       ├── filesystem.py    Read-only files; opens SQLite .db as text
-│       └── shell.py         Allowlisted commands
+│       ├── shell.py         Allowlisted commands
+│       └── solidity.py      Saves verified .sol files by their real names
+├── skills/                  Prompt skills you can add
+├── contracts/               Saved Solidity, one folder per address
+├── prompt                   Send a prompt in plain text
 ├── database/agent.db        Created on startup
 ├── logs/                    actions.jsonl and agent.log
 ├── screenshots/             PNG after each step
@@ -133,6 +139,49 @@ chmod +x run.sh
 4. Start FastAPI on `http://127.0.0.1:8000`.
 
 Stop the server with Ctrl+C while no task is running. During a task, Browser Use treats the first Ctrl+C as pause and the second as exit.
+
+## Give a prompt
+
+Start `./run.sh` in one terminal. In another:
+
+```bash
+./prompt Open Google and search for Ethereum price
+```
+
+Or run `./prompt` and type the sentence when it asks. The command waits, then prints the final result.
+
+Use a skill the same way. The first word is the skill name, and the rest are its arguments:
+
+```bash
+./prompt etherscan-contract 0x006FaD88c35D973A87E451CF8D000c7e83Dad409
+```
+
+That skill saves the verified Solidity before the browser opens. Each source file keeps its original name under `contracts/<address>/`, for example `contracts/<address>/lib/openzeppelin-contracts-v5/contracts/interfaces/IERC1967.sol`. A proxy also saves the implementation sources under `contracts/<implementation>/`.
+
+`./prompt --list` shows the skills that are installed.
+
+If the API is not running, `./prompt` starts the browser itself.
+
+## Add a skill
+
+Create `skills/your-skill.md`. A header, a blank line, then the prompt. Put `{argument}` where the command-line value should go.
+
+```markdown
+name: your-skill
+description: What this skill does
+args: query
+
+Open Google and search for {query}.
+Summarize the first result. Do not sign in.
+```
+
+Then run:
+
+```bash
+./prompt your-skill ethereum price
+```
+
+`args` is a comma-separated list when a skill needs more than one value. `validate: address=ethereum` checks that an argument is a 0x address. No other code change is required. Restart `./run.sh` after adding a file so the API reloads it. `./prompt` reads the folder on each run.
 
 ## API
 

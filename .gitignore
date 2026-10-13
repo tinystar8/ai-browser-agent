@@ -9,3 +9,4 @@ logs/agent-files/
 screenshots/*
 !screenshots/.gitkeep
 database/agent.db
+contracts/

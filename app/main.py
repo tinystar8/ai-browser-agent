@@ -20,12 +20,14 @@ from app.models import (
     HealthResponse,
     ShellRequest,
     ShellResponse,
+    SkillView,
     TaskCreateRequest,
     TaskCreateResponse,
     TaskStatusResponse,
     TaskSummary,
 )
 from app.safety import assess_task
+from app.skills import SkillError, list_skills, render_skill
 from app.tools.shell import execute as run_shell
 
 logger = logging.getLogger("ai_browser_agent")
@@ -76,7 +78,10 @@ async def create_task(body: TaskCreateRequest, request: Request) -> TaskCreateRe
 
     memory: MemoryStore = request.app.state.memory
     agent: Agent = request.app.state.agent
-    text = body.task.strip()
+    try:
+        text = _task_text(body)
+    except SkillError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     decision = assess_task(text)
 
     if decision.blocked:
@@ -98,6 +103,16 @@ async def create_task(body: TaskCreateRequest, request: Request) -> TaskCreateRe
     request.app.state.jobs.add(job)
     job.add_done_callback(request.app.state.jobs.discard)
     return TaskCreateResponse(task_id=task_id, status="running")
+
+
+@app.get("/skills", response_model=list[SkillView])
+async def skills() -> list[SkillView]:
+    """List prompt skills loaded from the skills directory."""
+
+    return [
+        SkillView(name=skill.name, description=skill.description, args=list(skill.args))
+        for skill in list_skills()
+    ]
 
 
 @app.get("/task/{task_id}", response_model=TaskStatusResponse)
@@ -166,6 +181,19 @@ async def shell(body: ShellRequest, request: Request) -> ShellResponse:
         outcome.reason,
     )
     return ShellResponse(status=outcome.status, output=outcome.output, reason=outcome.reason)
+
+
+def _task_text(body: TaskCreateRequest) -> str:
+    """Build the prompt from a free-text task, a skill, or both."""
+
+    parts: list[str] = []
+    if body.skill:
+        parts.append(render_skill(body.skill, body.args))
+    if body.task and body.task.strip():
+        parts.append(body.task.strip())
+    if not parts:
+        raise SkillError("Give a task or a skill.")
+    return "\n\n".join(parts)
 
 
 def _append_shell_log(path: Path, command: str, status: str, reason: str | None) -> None:
