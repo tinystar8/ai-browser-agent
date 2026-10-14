@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Browser agent</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      font-family: Georgia, "Iowan Old Style", serif;
+      background: #141414;
+      color: #f2f2f2;
+    }
+    header {
+      padding: 16px 20px 8px;
+      border-bottom: 1px solid #2a2a2a;
+    }
+    h1 { font-size: 20px; margin: 0 0 4px; font-weight: 600; }
+    #status { color: #a3a3a3; font-family: ui-sans-serif, sans-serif; font-size: 14px; }
+    #log {
+      height: calc(100vh - 148px);
+      overflow: auto;
+      padding: 16px 20px 8px;
+    }
+    .row { display: flex; margin: 8px 0; }
+    .row.user { justify-content: flex-end; }
+    .bubble {
+      max-width: min(720px, 80%);
+      padding: 10px 12px;
+      border-radius: 10px;
+      white-space: pre-wrap;
+      line-height: 1.4;
+      font-family: ui-sans-serif, sans-serif;
+      font-size: 15px;
+    }
+    .user .bubble { background: #1d4ed8; }
+    .agent .bubble { background: #242424; }
+    form {
+      display: flex;
+      gap: 8px;
+      padding: 12px 20px 16px;
+      border-top: 1px solid #2a2a2a;
+    }
+    input {
+      flex: 1;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid #3a3a3a;
+      background: #101010;
+      color: #f2f2f2;
+      font: 16px ui-sans-serif, sans-serif;
+    }
+    button {
+      padding: 12px 16px;
+      border: 0;
+      border-radius: 8px;
+      background: #f2f2f2;
+      color: #141414;
+      font: 600 15px ui-sans-serif, sans-serif;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Browser agent</h1>
+    <div id="status">Checking the agent…</div>
+  </header>
+  <div id="log"></div>
+  <form id="form">
+    <input id="text" autocomplete="off" placeholder="Tell the agent what to do. A running task follows this next.">
+    <button type="submit">Send</button>
+  </form>
+  <script>
+    const log = document.querySelector("#log");
+    const status = document.querySelector("#status");
+    const form = document.querySelector("#form");
+    const text = document.querySelector("#text");
+    let lastId = 0;
+
+    function addRow(role, body) {
+      const row = document.createElement("div");
+      row.className = "row " + (role === "user" ? "user" : "agent");
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.textContent = body;
+      row.appendChild(bubble);
+      log.appendChild(row);
+    }
+
+    function paint(data) {
+      const label = data.status === "running" || data.status === "steering"
+        ? "Running task " + (data.task_id ?? "")
+        : data.status === "waiting"
+          ? "Finished. The browser is still open. Send another instruction, or say close."
+          : data.status === "idle"
+            ? "Idle. A message starts a task."
+            : "Last task " + (data.task_id ?? "") + " is " + data.status;
+      status.textContent = label.trim();
+      for (const message of data.messages) {
+        if (message.id <= lastId) continue;
+        addRow(message.role, message.text);
+        lastId = message.id;
+      }
+      if (data.messages.length) log.scrollTop = log.scrollHeight;
+    }
+
+    async function refresh() {
+      const response = await fetch("/chat");
+      if (!response.ok) return;
+      paint(await response.json());
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const message = text.value.trim();
+      if (!message) return;
+      text.value = "";
+      const response = await fetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message }),
+      });
+      if (response.ok) paint(await response.json());
+    });
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

@@ -29,7 +29,8 @@ ai-browser-agent/
 │   ├── llm.py               LangChain client aimed at Ollama
 │   ├── skills.py            Loads skills/*.md
 │   ├── browser.py           Chromium profile and headless flag
-│   ├── memory.py            SQLite tasks, actions, JSON log
+│   ├── memory.py            SQLite tasks, actions, chat, instructions
+│   ├── static/index.html    Chat page for steering a running task
 │   ├── models.py            Request and response models
 │   ├── config.py            .env loading
 │   ├── safety.py            Block rules
@@ -140,6 +141,16 @@ chmod +x run.sh
 4. Start FastAPI on `http://127.0.0.1:8000`.
 
 Stop the server with Ctrl+C while no task is running. During a task, Browser Use treats the first Ctrl+C as pause and the second as exit.
+
+## Chat while it runs
+
+Start `./run.sh`, then open [http://127.0.0.1:8000/](http://127.0.0.1:8000/).
+
+Type a sentence and press Send. If nothing is running, that starts a task. If a task is already running, the message is given to the agent before its next click, and the click it had already chosen is skipped.
+
+When the task finishes, Chromium stays open. The chat asks you before closing it. Send the next instruction to continue in the same window, or send `close` to close it.
+
+Each message sent during a run is saved with the task and the page it was about. A later task that shares those words includes the instruction, so the agent can make the same decision again. A different kind of task does not inherit it.
 
 ## Give a prompt
 

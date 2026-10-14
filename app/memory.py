@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -36,10 +37,34 @@ CREATE TABLE IF NOT EXISTS actions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_actions_task_id ON actions(task_id);
+
+CREATE TABLE IF NOT EXISTS instructions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    instruction TEXT NOT NULL,
+    situation TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chat (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    role TEXT NOT NULL,
+    text TEXT NOT NULL,
+    task_id INTEGER,
+    created_at TEXT NOT NULL
+);
 """
 
 _RESULT_LIMIT = 50_000
 _DETAILS_LIMIT = 20_000
+_INSTRUCTION_LIMIT = 4_000
+_CHAT_LIMIT = 4_000
+_STOP_WORDS = frozenset(
+    """
+    a an the to of for and or in on at is it this that with from your my do be
+    when then you not into about just like also only same case
+    open search click read show look page find goto using
+    """.split()
+)
 
 
 def utc_now() -> str:
@@ -57,6 +82,27 @@ class StoredAction:
     action: str
     details: str | None
     timestamp: str
+
+
+@dataclass(frozen=True)
+class StoredInstruction:
+    """One user instruction kept for a later similar situation."""
+
+    id: int
+    instruction: str
+    situation: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class ChatLine:
+    """One line in the chat transcript."""
+
+    id: int
+    role: str
+    text: str
+    task_id: int | None
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -273,6 +319,108 @@ class MemoryStore:
         async with self._lock:
             return await asyncio.to_thread(_query)
 
+    async def remember_instruction(self, instruction: str, situation: str) -> None:
+        """Store an instruction together with the situation it was given in."""
+
+        now = utc_now()
+        text = _clip(instruction.strip(), _INSTRUCTION_LIMIT) or ""
+        case = _clip(situation.strip(), _INSTRUCTION_LIMIT) or text
+        if not text:
+            return
+
+        def _insert() -> None:
+            self._connection().execute(
+                """
+                INSERT INTO instructions (instruction, situation, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (text, case, now),
+            )
+            self._connection().commit()
+
+        async with self._lock:
+            await asyncio.to_thread(_insert)
+
+    async def relevant_instructions(self, situation: str, limit: int = 6) -> list[StoredInstruction]:
+        """Return earlier instructions whose situation shares words with this one."""
+
+        def _query() -> list[StoredInstruction]:
+            rows = self._connection().execute(
+                """
+                SELECT * FROM instructions
+                ORDER BY id DESC
+                LIMIT 200
+                """
+            ).fetchall()
+            current = _tokens(situation)
+            if not current:
+                return []
+            ranked: list[tuple[int, int, StoredInstruction]] = []
+            for row in rows:
+                item = _instruction_from_row(row)
+                if item.instruction.strip().lower() == situation.strip().lower():
+                    continue
+                overlap = len(current & _tokens(f"{item.situation}\n{item.instruction}"))
+                if overlap >= 2:
+                    ranked.append((overlap, item.id, item))
+            ranked.sort(key=lambda pair: (pair[0], pair[1]), reverse=True)
+            chosen = [item for _, _, item in ranked[:limit]]
+            return list(reversed(chosen))
+
+        async with self._lock:
+            return await asyncio.to_thread(_query)
+
+    async def add_chat(self, role: str, text: str, task_id: int | None = None) -> None:
+        """Append one chat line."""
+
+        now = utc_now()
+        stored = _clip(text.strip(), _CHAT_LIMIT) or ""
+        if not stored:
+            return
+
+        def _insert() -> None:
+            self._connection().execute(
+                """
+                INSERT INTO chat (role, text, task_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (role, stored, task_id, now),
+            )
+            self._connection().commit()
+
+        async with self._lock:
+            await asyncio.to_thread(_insert)
+
+    async def list_chat(self, limit: int = 80) -> list[ChatLine]:
+        """Return the latest chat lines, oldest first."""
+
+        def _query() -> list[ChatLine]:
+            rows = self._connection().execute(
+                """
+                SELECT * FROM (
+                    SELECT * FROM chat
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                ORDER BY id ASC
+                """,
+                (limit,),
+            ).fetchall()
+            return [_chat_from_row(row) for row in rows]
+
+        async with self._lock:
+            return await asyncio.to_thread(_query)
+
+
+def _tokens(text: str) -> set[str]:
+    """Words that can identify a situation. Short and common words are dropped."""
+
+    return {
+        word
+        for word in re.findall(r"[a-z0-9]{4,}", text.lower())
+        if word not in _STOP_WORDS
+    }
+
 
 def _clip(value: str | None, limit: int) -> str | None:
     if value is None:
@@ -291,6 +439,26 @@ def _task_from_row(row: sqlite3.Row, actions: tuple[StoredAction, ...]) -> Store
         finished_at=row["finished_at"],
         result=row["result"],
         actions=actions,
+    )
+
+
+def _instruction_from_row(row: sqlite3.Row) -> StoredInstruction:
+    return StoredInstruction(
+        id=int(row["id"]),
+        instruction=str(row["instruction"]),
+        situation=str(row["situation"]),
+        created_at=str(row["created_at"]),
+    )
+
+
+def _chat_from_row(row: sqlite3.Row) -> ChatLine:
+    task_id = row["task_id"]
+    return ChatLine(
+        id=int(row["id"]),
+        role=str(row["role"]),
+        text=str(row["text"]),
+        task_id=int(task_id) if task_id is not None else None,
+        created_at=str(row["created_at"]),
     )
 
 

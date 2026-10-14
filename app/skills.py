@@ -152,3 +152,33 @@ def _parse_checks(raw: str) -> dict[str, str]:
         arg, rule = item.split("=", 1)
         checks[arg.strip()] = rule.strip()
     return checks
+
+
+def expand_prompt(text: str, directory: Path | None = None) -> str:
+    """Turn a skill name plus arguments into a prompt. Other text stays as written."""
+
+    words = text.split()
+    if not words:
+        raise SkillError("Type a prompt.")
+    key = words[0].strip().lower()
+    skill: Skill | None = None
+    for item in list_skills(directory):
+        if item.name.lower() == key or item.path.stem.lower() == key:
+            skill = item
+            break
+    if skill is None:
+        return " ".join(words)
+    if not skill.args:
+        body = render_skill(skill.name, {}, directory)
+        extra = " ".join(words[1:]).strip()
+        return f"{body}\n\n{extra}" if extra else body
+    values: dict[str, str] = {}
+    if len(skill.args) == 1 and len(words) >= 2:
+        values[skill.args[0]] = " ".join(words[1:])
+    else:
+        if len(words) - 1 < len(skill.args):
+            expected = " ".join(skill.args)
+            raise SkillError(f"Usage: {skill.name} {expected}")
+        for name, value in zip(skill.args, words[1:], strict=False):
+            values[name] = value
+    return render_skill(skill.name, values, directory)

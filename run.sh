@@ -40,7 +40,7 @@ read_env() {
   fi
 }
 
-HOST_VALUE="$(read_env HOST 127.0.0.1)"
+HOST_VALUE="$(read_env HOST 0.0.0.0)"
 PORT_VALUE="$(read_env PORT 8000)"
 
 echo "Starting AI browser agent on http://${HOST_VALUE}:${PORT_VALUE}"

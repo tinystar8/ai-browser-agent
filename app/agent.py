@@ -10,19 +10,29 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
 from app.browser import build_browser
 from app.config import PROJECT_ROOT, Settings, get_settings
 from app.llm import build_agent_llm
-from app.memory import MemoryStore, StoredTask
+from app.memory import MemoryStore, StoredInstruction, StoredTask
 from app.safety import assess_action
 from app.tools.filesystem import FilesystemError, inspect_path
 from app.tools.shell import execute as run_shell
 from app.tools.solidity import SolidityError, save_verified_source
 
 logger = logging.getLogger("ai_browser_agent")
+
+_CLOSE_REQUEST = re.compile(
+    r"^(?:please\s+)?(?:yes(?:,| )?\s*)?close(?:\s+it|\s+the\s+browser)?[.!]?$",
+    re.IGNORECASE,
+)
+_KEEP_OPEN = (
+    "Finished. The browser stays open. "
+    "Send the next instruction, or say close to close it."
+)
 
 _SYSTEM_EXTRA = """
 You are a local browser assistant for the owner of this computer.
@@ -36,6 +46,9 @@ Type into an element with the field name text, never value:
 {"input": {"index": 2, "text": "Ethereum price"}}.
 Click: {"click": {"index": 5}}.
 When you finish, the done action must include a short factual result.
+Do not close the browser. The user decides when it closes.
+A follow-up user request overrides the plan you were following.
+Standing instructions from a similar past situation also apply.
 """.strip()
 
 
@@ -46,6 +59,65 @@ class Agent:
         self.memory = memory
         self.settings = settings or get_settings()
         self._block_reason: str | None = None
+        self._running = False
+        self._active_task_id: int | None = None
+        self._active_task_text = ""
+        self._last_url = ""
+        self._inbox: list[str] = []
+        self._browser: Any = None
+        self._browser_agent: Any = None
+        self._close_requested = False
+
+    @property
+    def is_running(self) -> bool:
+        """True while a browser task is in progress."""
+
+        return self._running
+
+    @property
+    def active_task_id(self) -> int | None:
+        return self._active_task_id
+
+    def situation(self) -> str:
+        """The current task and page, used to remember what an instruction was about."""
+
+        parts = [self._active_task_text.strip(), self._last_url.strip()]
+        return " | ".join(part for part in parts if part)
+
+    @property
+    def browser_is_open(self) -> bool:
+        """True after a task while Chromium is waiting for the next instruction."""
+
+        return self._browser is not None
+
+    def wants_close(self, text: str) -> bool:
+        """True when the user is confirming that the browser should close."""
+
+        return _CLOSE_REQUEST.fullmatch(text.strip()) is not None
+
+    def request_close(self) -> None:
+        """Stop the current step, then close Chromium when the task exits."""
+
+        self._close_requested = True
+        active = self._browser_agent
+        if self._running and active is not None and hasattr(active, "stop"):
+            active.stop()
+
+    async def close_browser(self) -> None:
+        """Close Chromium. Safe to call when it is already closed."""
+
+        browser = self._browser
+        self._browser = None
+        self._browser_agent = None
+        self._close_requested = False
+        await _close_browser(browser)
+
+    def steer(self, text: str) -> None:
+        """Queue an instruction for the running browser task."""
+
+        cleaned = text.strip()
+        if cleaned:
+            self._inbox.append(cleaned)
 
     async def execute(self, task_id: int) -> None:
         """Run the stored task until it completes, fails, or is blocked."""
@@ -56,19 +128,37 @@ class Agent:
             return
 
         self._block_reason = None
+        self._running = True
+        self._active_task_id = task_id
+        self._active_task_text = record.task
+        self._last_url = ""
         previous = await self.memory.recent_context(exclude_id=task_id)
-        prompt = _with_memory(record.task, previous)
+        guidance = await self.memory.relevant_instructions(record.task)
+        prompt = _with_memory(record.task, previous, guidance)
+        reused = self._browser is not None
+        if reused:
+            prompt = (
+                "The Chromium window is already open. Continue from the current page. "
+                "Do not close the browser.\n\n" + prompt
+            )
         await self.memory.add_action(task_id, "start", record.task, {"step": 0})
+        await self.memory.add_chat("agent", "Working on it.", task_id)
 
-        browser: Any = None
         try:
-            browser = build_browser(self.settings)
+            if self._browser is None:
+                self._browser = build_browser(self.settings)
+            else:
+                _prepare_kept_browser(self._browser)
+            browser = self._browser
             llm = build_agent_llm(self.settings)
             tools = _build_tools(self.settings)
             holder: dict[str, Any] = {}
 
             async def on_step(browser_state: Any, model_output: Any, step: int) -> None:
                 await self._on_step(task_id, browser_state, model_output, step, holder)
+
+            async def on_start(browser_agent: Any) -> None:
+                await self._apply_steering(task_id, browser_agent)
 
             browser_agent = _construct_browser_agent(
                 task=prompt,
@@ -79,21 +169,40 @@ class Agent:
                 on_step=on_step,
             )
             holder["agent"] = browser_agent
-            history = await browser_agent.run(max_steps=self.settings.max_steps)
+            self._browser_agent = browser_agent
+            history = await browser_agent.run(
+                max_steps=self.settings.max_steps,
+                on_step_start=on_start,
+            )
             if self._block_reason:
                 await self.memory.finish_task(task_id, "blocked", self._block_reason)
+                await self.memory.add_chat("agent", self._block_reason, task_id)
                 return
             result = _history_result(history)
             await self.memory.add_action(task_id, "done", "task finished", {"result": result[:500]})
             await self.memory.finish_task(task_id, "completed", result)
+            await self.memory.add_chat("agent", result, task_id)
         except Exception as exc:
             if self._block_reason:
                 await self.memory.finish_task(task_id, "blocked", self._block_reason)
+                await self.memory.add_chat("agent", self._block_reason, task_id)
                 return
             logger.exception("Task %s failed", task_id)
-            await self.memory.finish_task(task_id, "failed", f"{type(exc).__name__}: {exc}")
+            message = f"{type(exc).__name__}: {exc}"
+            await self.memory.finish_task(task_id, "failed", message)
+            await self.memory.add_chat("agent", message, task_id)
         finally:
-            await _close_browser(browser)
+            self._inbox.clear()
+            self._running = False
+            self._active_task_id = None
+            self._active_task_text = ""
+            self._browser_agent = None
+            if self._browser is not None:
+                if self._close_requested:
+                    await self.close_browser()
+                    await self.memory.add_chat("agent", "Closed the browser.", task_id)
+                else:
+                    await self.memory.add_chat("agent", _KEEP_OPEN, task_id)
 
     async def _on_step(
         self,
@@ -106,7 +215,12 @@ class Agent:
         """Log the step, save a screenshot, and stop before a dangerous action."""
 
         url = str(getattr(browser_state, "url", "") or "")
+        if url:
+            self._last_url = url
+        steered = await self._apply_steering(task_id, holder.get("agent"), model_output)
         await _save_screenshot(self.settings.screenshots_path, task_id, step, browser_state)
+        if steered:
+            return
 
         goal = ""
         state = getattr(model_output, "current_state", None)
@@ -135,23 +249,80 @@ class Agent:
                 target,
                 {"step": step, "url": url, "goal": goal},
             )
+        if goal:
+            await self.memory.add_chat("agent", goal, task_id)
+
+    def _drain(self) -> list[str]:
+        if not self._inbox:
+            return []
+        notes = self._inbox
+        self._inbox = []
+        return notes
+
+    async def _apply_steering(
+        self,
+        task_id: int,
+        browser_agent: Any,
+        model_output: Any = None,
+    ) -> bool:
+        """Give queued user instructions to the model before the next action."""
+
+        notes = self._drain()
+        if not notes:
+            return False
+        _inject_instruction(browser_agent, notes)
+        if model_output is not None and getattr(model_output, "action", None):
+            # The model chose this action before it saw the new instruction.
+            model_output.action = []
+        text = "Following your instruction: " + " | ".join(notes)
+        await self.memory.add_chat("agent", text, task_id)
+        return True
 
 
-def _with_memory(task: str, previous: list[StoredTask]) -> str:
+def _inject_instruction(browser_agent: Any, notes: list[str]) -> None:
+    """Append a follow-up to the running Browser Use conversation."""
+
+    if browser_agent is None:
+        return
+    manager = getattr(browser_agent, "_message_manager", None)
+    if manager is None or not hasattr(manager, "add_new_task"):
+        logger.warning("The running agent cannot accept a follow-up instruction.")
+        return
+    body = "Follow this instruction now. It overrides the previous plan:\n" + "\n".join(
+        f"- {note}" for note in notes
+    )
+    manager.add_new_task(body)
+
+
+def _with_memory(
+    task: str,
+    previous: list[StoredTask],
+    guidance: list[StoredInstruction] | None = None,
+) -> str:
     """Append a short recall of earlier tasks. The stored task text stays unchanged."""
 
-    if not previous:
-        return task
-    lines: list[str] = []
-    for item in previous:
-        snippet = " ".join((item.result or "").split())[:240]
-        lines.append(f"- {item.task} [{item.status}] {snippet}".rstrip())
-    recall = "\n".join(lines)
-    return (
-        f"{task}\n\n"
-        "Earlier tasks for this user, oldest first. Use them only as context.\n"
-        f"{recall}"
-    )
+    parts = [task]
+    if guidance:
+        lines = [
+            f"- Situation: {item.situation}\n  Do this: {item.instruction}"
+            for item in guidance
+        ]
+        parts.append(
+            "Earlier instructions from the user for a similar situation. "
+            "Make the same kind of decision when this case matches. "
+            "Ignore an instruction when the situation is different.\n"
+            + "\n".join(lines)
+        )
+    if previous:
+        lines = []
+        for item in previous:
+            snippet = " ".join((item.result or "").split())[:240]
+            lines.append(f"- {item.task} [{item.status}] {snippet}".rstrip())
+        parts.append(
+            "Earlier tasks for this user, oldest first. Use them only as context.\n"
+            + "\n".join(lines)
+        )
+    return "\n\n".join(parts)
 
 
 def _iter_actions(model_output: Any) -> list[tuple[str, str]]:
@@ -205,6 +376,22 @@ async def _save_screenshot(directory: Path, task_id: int, step: int, browser_sta
         target.write_bytes(payload)
     except Exception:
         logger.warning("Could not save screenshot for task %s step %s", task_id, step, exc_info=True)
+
+
+def _prepare_kept_browser(browser: Any) -> None:
+    """Give a kept-open Chromium a live event bus for the next task.
+
+    Browser Use stops that bus when a task ends, even when the window stays open.
+    """
+
+    bus = getattr(browser, "event_bus", None)
+    if bus is not None and getattr(bus, "event_queue", None) is not None:
+        return
+    from bubus import EventBus
+
+    browser.event_bus = EventBus(name="browser-kept-open")
+    if hasattr(browser, "_watchdogs_attached"):
+        browser._watchdogs_attached = False
 
 
 async def _close_browser(browser: Any) -> None:

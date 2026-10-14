@@ -23,6 +23,6 @@ def build_browser(settings: Settings | None = None) -> Any:
         headless=cfg.headless,
         user_data_dir=str(cfg.profile_path),
         window_size={"width": 1280, "height": 800},
-        keep_alive=False,
+        keep_alive=True,
         enable_default_extensions=True,
     )

@@ -11,6 +11,7 @@ from typing import AsyncIterator
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 
 from app.agent import Agent
 from app.config import PROJECT_ROOT, Settings, get_settings
@@ -20,6 +21,9 @@ from app.models import (
     HealthResponse,
     ShellRequest,
     ShellResponse,
+    ChatMessage,
+    ChatRequest,
+    ChatState,
     SkillView,
     TaskCreateRequest,
     TaskCreateResponse,
@@ -27,7 +31,7 @@ from app.models import (
     TaskSummary,
 )
 from app.safety import assess_task
-from app.skills import SkillError, list_skills, render_skill
+from app.skills import SkillError, expand_prompt, list_skills, render_skill
 from app.tools.shell import execute as run_shell
 
 logger = logging.getLogger("ai_browser_agent")
@@ -51,6 +55,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.submit_lock = asyncio.Lock()
     logger.info("Agent API ready on %s:%s", settings.host, settings.port)
     yield
+    await app.state.agent.close_browser()
 
 
 app = FastAPI(
@@ -58,6 +63,81 @@ app = FastAPI(
     summary="Local Qwen browser agent using Ollama, Browser Use, and Playwright.",
     lifespan=lifespan,
 )
+
+
+@app.get("/", response_class=HTMLResponse)
+async def chat_page() -> str:
+    """Serve the chat page used to start and steer the agent."""
+
+    page = PROJECT_ROOT / "app" / "static" / "index.html"
+    return page.read_text(encoding="utf-8")
+
+
+@app.get("/chat", response_model=ChatState)
+async def read_chat(request: Request) -> ChatState:
+    """Return the transcript and whether a browser task is running."""
+
+    return await _chat_state(request)
+
+
+@app.post("/chat", response_model=ChatState)
+async def post_chat(body: ChatRequest, request: Request) -> ChatState:
+    """Start a task, or steer the one that is already running."""
+
+    memory: MemoryStore = request.app.state.memory
+    agent: Agent = request.app.state.agent
+    message = body.message.strip()
+    decision = assess_task(message)
+    await memory.add_chat("user", message, agent.active_task_id)
+    if decision.blocked:
+        await memory.add_chat("agent", decision.reason, agent.active_task_id)
+        state = await _chat_state(request, status="blocked")
+        return state.model_copy(update={"reply": decision.reason})
+
+    if agent.wants_close(message):
+        if agent.is_running:
+            agent.request_close()
+            await memory.add_chat(
+                "agent",
+                "Stopping. I will close the browser when this step finishes.",
+                agent.active_task_id,
+            )
+            state = await _chat_state(request, status="steering", task_id=agent.active_task_id)
+            return state.model_copy(update={"reply": "Closing after this step."})
+        if agent.browser_is_open:
+            reply = "Closed the browser."
+            await agent.close_browser()
+        else:
+            reply = "The browser is already closed."
+        await memory.add_chat("agent", reply)
+        state = await _chat_state(request, status="idle")
+        return state.model_copy(update={"reply": reply})
+
+    async with request.app.state.submit_lock:
+        if agent.is_running or await memory.has_active_task():
+            situation = agent.situation() or message
+            await memory.remember_instruction(message, situation)
+            agent.steer(message)
+            task_id = agent.active_task_id
+            state = await _chat_state(request, status="steering", task_id=task_id)
+            return state.model_copy(update={"reply": "Sent to the running agent."})
+
+        try:
+            text = expand_prompt(message)
+        except SkillError as exc:
+            await memory.add_chat("agent", str(exc))
+            state = await _chat_state(request, status="idle")
+            return state.model_copy(update={"reply": str(exc)})
+        task_id = await memory.create_task(text, "running")
+
+    saved = _saved_paths(text)
+    if saved:
+        await memory.add_chat("agent", "Saved Solidity source:\n" + "\n".join(saved), task_id)
+    job = asyncio.create_task(agent.execute(task_id), name=f"task-{task_id}")
+    request.app.state.jobs.add(job)
+    job.add_done_callback(request.app.state.jobs.discard)
+    state = await _chat_state(request, status="running", task_id=task_id)
+    return state.model_copy(update={"saved": saved})
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -181,6 +261,52 @@ async def shell(body: ShellRequest, request: Request) -> ShellResponse:
         outcome.reason,
     )
     return ShellResponse(status=outcome.status, output=outcome.output, reason=outcome.reason)
+
+
+async def _chat_state(
+    request: Request,
+    status: str | None = None,
+    task_id: int | None = None,
+) -> ChatState:
+    """Build the transcript payload. An explicit status wins over the database."""
+
+    memory: MemoryStore = request.app.state.memory
+    agent: Agent = request.app.state.agent
+    lines = await memory.list_chat()
+    messages = [
+        ChatMessage(
+            id=line.id,
+            role=line.role,
+            text=line.text,
+            task_id=line.task_id,
+            created_at=line.created_at,
+        )
+        for line in lines
+    ]
+    if status is None:
+        if agent.is_running:
+            status = "running"
+            task_id = agent.active_task_id
+        elif agent.browser_is_open:
+            status = "waiting"
+            recent = await memory.list_tasks(1)
+            task_id = recent[0].id if recent else None
+        else:
+            recent = await memory.list_tasks(1)
+            if recent:
+                status = recent[0].status
+                task_id = recent[0].id
+            else:
+                status = "idle"
+    return ChatState(status=status, task_id=task_id, messages=messages)
+
+
+def _saved_paths(text: str) -> list[str]:
+    return [
+        line.removeprefix("Saved file: ").strip()
+        for line in text.splitlines()
+        if line.startswith("Saved file: ")
+    ]
 
 
 def _task_text(body: TaskCreateRequest) -> str:

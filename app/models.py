@@ -75,6 +75,32 @@ class ShellRequest(BaseModel):
     confirm: bool = False
 
 
+class ChatRequest(BaseModel):
+    """Body of POST /chat."""
+
+    message: str = Field(min_length=1, max_length=16000)
+
+
+class ChatMessage(BaseModel):
+    """One line in the chat transcript."""
+
+    id: int
+    role: str
+    text: str
+    task_id: int | None = None
+    created_at: str
+
+
+class ChatState(BaseModel):
+    """What the chat page polls, and the reply to a sent message."""
+
+    status: str
+    task_id: int | None = None
+    reply: str | None = None
+    saved: list[str] = Field(default_factory=list)
+    messages: list[ChatMessage] = Field(default_factory=list)
+
+
 class ShellResponse(BaseModel):
     """Result of a shell tool call."""
 

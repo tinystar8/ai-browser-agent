@@ -20,7 +20,7 @@ from app.agent import Agent
 from app.config import get_settings
 from app.memory import MemoryStore
 from app.safety import assess_task
-from app.skills import Skill, SkillError, list_skills, render_skill
+from app.skills import SkillError, expand_prompt, list_skills
 
 _API = "http://127.0.0.1:8000"
 
@@ -40,11 +40,16 @@ def main() -> None:
         if args.list:
             _print_skills()
             return
-        text = _prompt_from_words(args.words)
-        _print_saved_files(text)
         if _api_is_up():
-            _run_via_api(text)
+            raw = " ".join(args.words).strip()
+            if not raw:
+                raw = input("Prompt: ").strip()
+            if not raw:
+                raise SkillError("Type a prompt, or run ./prompt --list")
+            _run_via_api(raw)
         else:
+            text = _prompt_from_words(args.words)
+            _print_saved_files(text)
             asyncio.run(_run_locally(text))
     except SkillError as exc:
         print(exc, file=sys.stderr)
@@ -68,25 +73,7 @@ def _prompt_from_words(words: list[str]) -> str:
             raise SkillError("Type a prompt, or run ./prompt --list")
         return _prompt_from_words(typed.split())
 
-    skill = _match_skill(words[0])
-    if skill is None:
-        return " ".join(words)
-
-    if not skill.args:
-        body = render_skill(skill.name, {})
-        extra = " ".join(words[1:]).strip()
-        return f"{body}\n\n{extra}" if extra else body
-
-    values: dict[str, str] = {}
-    if len(skill.args) == 1 and len(words) >= 2:
-        values[skill.args[0]] = " ".join(words[1:])
-    else:
-        if len(words) - 1 < len(skill.args):
-            expected = " ".join(skill.args)
-            raise SkillError(f"Usage: ./prompt {skill.name} {expected}")
-        for name, value in zip(skill.args, words[1:], strict=False):
-            values[name] = value
-    return render_skill(skill.name, values)
+    return expand_prompt(" ".join(words))
 
 
 def _print_saved_files(text: str) -> None:
@@ -104,14 +91,6 @@ def _print_saved_files(text: str) -> None:
         print(path)
 
 
-def _match_skill(name: str) -> Skill | None:
-    key = name.strip().lower()
-    for skill in list_skills():
-        if skill.name.lower() == key or skill.path.stem.lower() == key:
-            return skill
-    return None
-
-
 def _api_is_up() -> bool:
     try:
         with urllib.request.urlopen(f"{_API}/health", timeout=1) as response:
@@ -121,9 +100,9 @@ def _api_is_up() -> bool:
 
 
 def _run_via_api(text: str) -> None:
-    payload = json.dumps({"task": text}).encode()
+    payload = json.dumps({"message": text}).encode()
     request = urllib.request.Request(
-        f"{_API}/task",
+        f"{_API}/chat",
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -135,11 +114,28 @@ def _run_via_api(text: str) -> None:
         detail = exc.read().decode("utf-8", errors="replace")
         raise SkillError(detail) from exc
 
-    task_id = created["task_id"]
-    print(f"task_id {task_id} ({created['status']})")
-    if created["status"] != "running":
-        if created.get("reason"):
-            print(created["reason"])
+    status = created["status"]
+    saved = created.get("saved") or []
+    if saved:
+        print("Saved Solidity source:")
+        for path in saved:
+            print(path)
+    if status == "steering":
+        print(created.get("reply") or f"Sent to the running task {created.get('task_id')}.")
+        return
+    if status in {"idle", "waiting"}:
+        reply = created.get("reply")
+        if reply:
+            print(reply)
+        return
+    task_id = created.get("task_id")
+    print(f"task_id {task_id} ({status})")
+    if status != "running" or task_id is None:
+        reply = created.get("reply") or created.get("reason")
+        if reply:
+            print(reply)
+        if status != "running":
+            raise SystemExit(1)
         return
 
     while True:
@@ -148,6 +144,7 @@ def _run_via_api(text: str) -> None:
         status = record["status"]
         if status in {"completed", "failed", "blocked"}:
             print(record.get("result") or "")
+            print("The browser stays open. Send the next instruction in the chat, or run ./prompt close")
             if status != "completed":
                 raise SystemExit(1)
             return
@@ -160,21 +157,49 @@ async def _run_locally(text: str) -> None:
     settings = get_settings()
     memory = MemoryStore(settings.database_file, settings.action_log_file)
     await memory.init()
-    decision = assess_task(text)
-    if decision.blocked:
-        task_id = await memory.create_task(text, "blocked", decision.reason)
-        print(f"task_id {task_id} (blocked)")
-        print(decision.reason)
-        raise SystemExit(1)
     if await memory.has_active_task():
         raise SkillError("A browser task is already running.")
 
-    task_id = await memory.create_task(text, "running")
-    print(f"task_id {task_id} (running)")
-    await Agent(memory, settings).execute(task_id)
-    record = await memory.get_task(task_id)
-    print(record.result if record and record.result else "")
-    if record is None or record.status != "completed":
+    agent = Agent(memory, settings)
+    failed = False
+    current = text
+    try:
+        while True:
+            decision = assess_task(current)
+            if decision.blocked:
+                task_id = await memory.create_task(current, "blocked", decision.reason)
+                print(f"task_id {task_id} (blocked)")
+                print(decision.reason)
+                failed = True
+                break
+            if await memory.has_active_task():
+                raise SkillError("A browser task is already running.")
+            task_id = await memory.create_task(current, "running")
+            print(f"task_id {task_id} (running)")
+            await agent.execute(task_id)
+            record = await memory.get_task(task_id)
+            print(record.result if record and record.result else "")
+            if record is None or record.status != "completed":
+                failed = True
+            if not agent.browser_is_open:
+                break
+            print("The browser stays open. Type the next instruction, or type close.")
+            try:
+                nxt = input("> ").strip()
+            except EOFError:
+                break
+            if agent.wants_close(nxt):
+                await agent.close_browser()
+                print("Closed the browser.")
+                break
+            if not nxt:
+                continue
+            current = expand_prompt(nxt)
+            failed = False
+    finally:
+        if agent.browser_is_open:
+            await agent.close_browser()
+    if failed:
         raise SystemExit(1)
 
 
