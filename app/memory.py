@@ -50,14 +50,15 @@ CREATE TABLE IF NOT EXISTS chat (
     role TEXT NOT NULL,
     text TEXT NOT NULL,
     task_id INTEGER,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    images TEXT
 );
 """
 
 _RESULT_LIMIT = 50_000
 _DETAILS_LIMIT = 20_000
 _INSTRUCTION_LIMIT = 4_000
-_CHAT_LIMIT = 4_000
+_CHAT_LIMIT = 16_000
 _STOP_WORDS = frozenset(
     """
     a an the to of for and or in on at is it this that with from your my do be
@@ -103,6 +104,7 @@ class ChatLine:
     text: str
     task_id: int | None
     created_at: str
+    images: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -138,6 +140,7 @@ class MemoryStore:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys = ON")
             conn.executescript(_SCHEMA)
+            _ensure_chat_images(conn)
             conn.commit()
             return conn
 
@@ -370,21 +373,29 @@ class MemoryStore:
         async with self._lock:
             return await asyncio.to_thread(_query)
 
-    async def add_chat(self, role: str, text: str, task_id: int | None = None) -> None:
+    async def add_chat(
+        self,
+        role: str,
+        text: str,
+        task_id: int | None = None,
+        images: list[str] | None = None,
+    ) -> None:
         """Append one chat line."""
 
         now = utc_now()
         stored = _clip(text.strip(), _CHAT_LIMIT) or ""
-        if not stored:
+        picture_list = [item for item in (images or []) if item]
+        if not stored and not picture_list:
             return
+        picture_json = json.dumps(picture_list) if picture_list else None
 
         def _insert() -> None:
             self._connection().execute(
                 """
-                INSERT INTO chat (role, text, task_id, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO chat (role, text, task_id, created_at, images)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (role, stored, task_id, now),
+                (role, stored, task_id, now, picture_json),
             )
             self._connection().commit()
 
@@ -453,13 +464,31 @@ def _instruction_from_row(row: sqlite3.Row) -> StoredInstruction:
 
 def _chat_from_row(row: sqlite3.Row) -> ChatLine:
     task_id = row["task_id"]
+    raw = row["images"] if "images" in row.keys() else None
+    pictures: list[str] = []
+    if raw:
+        try:
+            parsed = json.loads(str(raw))
+        except json.JSONDecodeError:
+            parsed = []
+        if isinstance(parsed, list):
+            pictures = [str(item) for item in parsed if isinstance(item, str)]
     return ChatLine(
         id=int(row["id"]),
         role=str(row["role"]),
         text=str(row["text"]),
         task_id=int(task_id) if task_id is not None else None,
         created_at=str(row["created_at"]),
+        images=tuple(pictures),
     )
+
+
+def _ensure_chat_images(conn: sqlite3.Connection) -> None:
+    """Add the picture column on databases created before attachments existed."""
+
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(chat)")}
+    if "images" not in columns:
+        conn.execute("ALTER TABLE chat ADD COLUMN images TEXT")
 
 
 def _action_from_row(row: sqlite3.Row) -> StoredAction:

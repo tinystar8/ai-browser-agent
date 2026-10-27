@@ -6,21 +6,36 @@
   <title>Browser agent</title>
   <style>
     :root { color-scheme: dark; }
+    html, body { height: 100%; }
     body {
       margin: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
       font-family: Georgia, "Iowan Old Style", serif;
       background: #141414;
       color: #f2f2f2;
     }
     header {
+      flex: none;
       padding: 16px 20px 8px;
       border-bottom: 1px solid #2a2a2a;
     }
-    h1 { font-size: 20px; margin: 0 0 4px; font-weight: 600; }
+    h1 { font-size: 20px; margin: 0 0 8px; font-weight: 600; }
+    #modes { display: flex; gap: 8px; margin-bottom: 8px; }
+    #modes button {
+      background: #242424;
+      color: #f2f2f2;
+    }
+    #modes button.selected {
+      background: #f2f2f2;
+      color: #141414;
+    }
     #status { color: #a3a3a3; font-family: ui-sans-serif, sans-serif; font-size: 14px; }
     #log {
-      height: calc(100vh - 148px);
-      overflow: auto;
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
       padding: 16px 20px 8px;
     }
     .row { display: flex; margin: 8px 0; }
@@ -34,22 +49,55 @@
       font-family: ui-sans-serif, sans-serif;
       font-size: 15px;
     }
+    .bubble img {
+      display: block;
+      max-width: 100%;
+      max-height: 240px;
+      margin-top: 8px;
+      border-radius: 6px;
+    }
     .user .bubble { background: #1d4ed8; }
     .agent .bubble { background: #242424; }
     form {
+      flex: none;
       display: flex;
+      flex-direction: column;
       gap: 8px;
       padding: 12px 20px 16px;
       border-top: 1px solid #2a2a2a;
     }
-    input {
+    #previews { display: flex; gap: 8px; flex-wrap: wrap; }
+    #previews:empty { display: none; }
+    .preview {
+      position: relative;
+    }
+    .preview img {
+      width: 72px;
+      height: 72px;
+      object-fit: cover;
+      border-radius: 8px;
+      display: block;
+    }
+    .preview button {
+      position: absolute;
+      top: 2px;
+      right: 2px;
+      padding: 0 6px;
+      background: #141414;
+      color: #f2f2f2;
+    }
+    .composer { display: flex; gap: 8px; align-items: flex-end; }
+    textarea {
       flex: 1;
+      min-height: 48px;
+      max-height: 160px;
+      resize: none;
       padding: 12px;
       border-radius: 8px;
       border: 1px solid #3a3a3a;
       background: #101010;
       color: #f2f2f2;
-      font: 16px ui-sans-serif, sans-serif;
+      font: 16px ui-monospace, ui-sans-serif, monospace;
     }
     button {
       padding: 12px 16px;
@@ -60,36 +108,82 @@
       font: 600 15px ui-sans-serif, sans-serif;
       cursor: pointer;
     }
+    #file { display: none; }
   </style>
 </head>
 <body>
   <header>
     <h1>Browser agent</h1>
+    <div id="modes">
+      <button type="button" data-mode="auto" class="selected">Auto</button>
+      <button type="button" data-mode="manual">Manual</button>
+    </div>
     <div id="status">Checking the agent…</div>
   </header>
   <div id="log"></div>
   <form id="form">
-    <input id="text" autocomplete="off" placeholder="Tell the agent what to do. A running task follows this next.">
-    <button type="submit">Send</button>
+    <div id="previews"></div>
+    <div class="composer">
+      <button type="button" id="attach">Picture</button>
+      <textarea id="text" rows="2" placeholder="Tell the agent what to do. Shift+Enter adds a line."></textarea>
+      <button type="submit">Send</button>
+    </div>
+    <input id="file" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple>
   </form>
   <script>
     const log = document.querySelector("#log");
     const status = document.querySelector("#status");
     const form = document.querySelector("#form");
     const text = document.querySelector("#text");
+    const file = document.querySelector("#file");
+    const previews = document.querySelector("#previews");
+    const modeButtons = document.querySelectorAll("#modes button");
     let lastId = 0;
+    let stickToBottom = true;
+    let mode = "auto";
+    const pictures = [];
 
-    function addRow(role, body) {
+    function atBottom() {
+      return log.scrollHeight - log.scrollTop - log.clientHeight < 64;
+    }
+
+    log.addEventListener("scroll", () => {
+      stickToBottom = atBottom();
+    });
+
+    function addRow(role, body, images) {
       const row = document.createElement("div");
       row.className = "row " + (role === "user" ? "user" : "agent");
       const bubble = document.createElement("div");
       bubble.className = "bubble";
-      bubble.textContent = body;
+      if (body) bubble.textContent = body;
+      for (const src of images || []) {
+        const img = document.createElement("img");
+        img.src = src;
+        img.alt = "Attached picture";
+        bubble.appendChild(img);
+      }
       row.appendChild(bubble);
       log.appendChild(row);
     }
 
+    function showMode(next) {
+      mode = next === "manual" ? "manual" : "auto";
+      for (const button of modeButtons) {
+        button.classList.toggle("selected", button.dataset.mode === mode);
+      }
+    }
+
+    function placeholder(data) {
+      if (mode === "manual") return "One instruction. Code or other text. Shift+Enter adds a line.";
+      if (data.status === "waiting") return "Command the open window. Say close to close it.";
+      if (data.status === "running" || data.status === "steering") return "The running task follows this next.";
+      return "Tell the agent what to do. Shift+Enter adds a line.";
+    }
+
     function paint(data) {
+      showMode(data.mode);
+      const prefix = mode === "manual" ? "Manual. " : "Auto. ";
       const label = data.status === "running" || data.status === "steering"
         ? "Running task " + (data.task_id ?? "")
         : data.status === "waiting"
@@ -97,13 +191,15 @@
           : data.status === "idle"
             ? "Idle. A message starts a task."
             : "Last task " + (data.task_id ?? "") + " is " + data.status;
-      status.textContent = label.trim();
+      status.textContent = prefix + label.trim();
+      text.placeholder = placeholder(data);
+      const follow = stickToBottom;
       for (const message of data.messages) {
         if (message.id <= lastId) continue;
-        addRow(message.role, message.text);
+        addRow(message.role, message.text, message.images);
         lastId = message.id;
       }
-      if (data.messages.length) log.scrollTop = log.scrollHeight;
+      if (follow) log.scrollTop = log.scrollHeight;
     }
 
     async function refresh() {
@@ -112,17 +208,89 @@
       paint(await response.json());
     }
 
+    function renderPreviews() {
+      previews.replaceChildren();
+      pictures.forEach((picture, index) => {
+        const item = document.createElement("div");
+        item.className = "preview";
+        const img = document.createElement("img");
+        img.src = picture;
+        img.alt = "Picture to send";
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.textContent = "×";
+        remove.addEventListener("click", () => {
+          pictures.splice(index, 1);
+          renderPreviews();
+        });
+        item.append(img, remove);
+        previews.appendChild(item);
+      });
+    }
+
+    document.querySelector("#attach").addEventListener("click", () => file.click());
+    file.addEventListener("change", () => {
+      const chosen = Array.from(file.files || []);
+      file.value = "";
+      for (const item of chosen) {
+        if (pictures.length >= 4) {
+          status.textContent = "Attach up to 4 pictures.";
+          break;
+        }
+        if (item.size > 4 * 1024 * 1024) {
+          status.textContent = "Each picture must be under 4 MB.";
+          continue;
+        }
+        const reader = new FileReader();
+        reader.onload = () => {
+          if (typeof reader.result === "string") pictures.push(reader.result);
+          renderPreviews();
+        };
+        reader.readAsDataURL(item);
+      }
+    });
+
+    for (const button of modeButtons) {
+      button.addEventListener("click", async () => {
+        const next = button.dataset.mode;
+        showMode(next);
+        const response = await fetch("/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode: next }),
+        });
+        if (response.ok) paint(await response.json());
+      });
+    }
+
+    text.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        form.requestSubmit();
+      }
+    });
+
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const message = text.value.trim();
-      if (!message) return;
+      if (!message && pictures.length === 0) return;
+      const images = pictures.splice(0, pictures.length);
+      renderPreviews();
       text.value = "";
+      stickToBottom = true;
       const response = await fetch("/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message }),
+        body: JSON.stringify({ message, mode, images }),
       });
-      if (response.ok) paint(await response.json());
+      if (!response.ok) {
+        pictures.unshift(...images);
+        renderPreviews();
+        text.value = message;
+        status.textContent = "The picture could not be sent.";
+        return;
+      }
+      paint(await response.json());
     });
 
     refresh();

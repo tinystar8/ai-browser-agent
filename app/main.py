@@ -11,9 +11,10 @@ from typing import AsyncIterator
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 
 from app.agent import Agent
+from app.chat_images import ChatImageError, image_file, save_chat_images
 from app.config import PROJECT_ROOT, Settings, get_settings
 from app.memory import MemoryStore, utc_now
 from app.models import (
@@ -82,19 +83,31 @@ async def read_chat(request: Request) -> ChatState:
 
 @app.post("/chat", response_model=ChatState)
 async def post_chat(body: ChatRequest, request: Request) -> ChatState:
-    """Start a task, or steer the one that is already running."""
+    """Start a task, steer the one that is already running, or switch mode."""
 
     memory: MemoryStore = request.app.state.memory
     agent: Agent = request.app.state.agent
+    settings: Settings = request.app.state.settings
+    if body.mode in {"auto", "manual"}:
+        agent.set_mode(body.mode)
     message = body.message.strip()
+    try:
+        stored_urls, data_urls = save_chat_images(
+            body.images, settings.logs_path / "chat-images"
+        )
+    except ChatImageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not message and not stored_urls:
+        return await _chat_state(request)
+
     decision = assess_task(message)
-    await memory.add_chat("user", message, agent.active_task_id)
+    await memory.add_chat("user", message, agent.active_task_id, images=stored_urls)
     if decision.blocked:
         await memory.add_chat("agent", decision.reason, agent.active_task_id)
         state = await _chat_state(request, status="blocked")
         return state.model_copy(update={"reply": decision.reason})
 
-    if agent.wants_close(message):
+    if message and agent.wants_close(message):
         if agent.is_running:
             agent.request_close()
             await memory.add_chat(
@@ -113,22 +126,28 @@ async def post_chat(body: ChatRequest, request: Request) -> ChatState:
         state = await _chat_state(request, status="idle")
         return state.model_copy(update={"reply": reply})
 
+    manual = agent.mode == "manual"
     async with request.app.state.submit_lock:
         if agent.is_running or await memory.has_active_task():
-            situation = agent.situation() or message
-            await memory.remember_instruction(message, situation)
-            agent.steer(message)
+            if not manual:
+                situation = agent.situation() or message
+                await memory.remember_instruction(message or "Use the attached picture.", situation)
+            agent.steer(message or "Use the attached picture.", data_urls)
             task_id = agent.active_task_id
             state = await _chat_state(request, status="steering", task_id=task_id)
-            return state.model_copy(update={"reply": "Sent to the running agent."})
+            reply = "Sent. The agent will do only this." if manual else "Sent to the running agent."
+            return state.model_copy(update={"reply": reply})
 
         try:
-            text = expand_prompt(message)
+            text = _instruction_text(message, manual)
         except SkillError as exc:
             await memory.add_chat("agent", str(exc))
             state = await _chat_state(request, status="idle")
             return state.model_copy(update={"reply": str(exc)})
+        if data_urls:
+            text += "\n\nA picture is attached to this instruction. Use that picture."
         task_id = await memory.create_task(text, "running")
+        agent.arm_turn(manual=manual, image_urls=data_urls)
 
     saved = _saved_paths(text)
     if saved:
@@ -138,6 +157,17 @@ async def post_chat(body: ChatRequest, request: Request) -> ChatState:
     job.add_done_callback(request.app.state.jobs.discard)
     state = await _chat_state(request, status="running", task_id=task_id)
     return state.model_copy(update={"saved": saved})
+
+
+@app.get("/chat/images/{name}")
+async def chat_image(name: str, request: Request) -> FileResponse:
+    """Serve one picture that was attached in the chat."""
+
+    settings: Settings = request.app.state.settings
+    path = image_file(settings.logs_path / "chat-images", name)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Picture not found.")
+    return FileResponse(path)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -280,6 +310,7 @@ async def _chat_state(
             text=line.text,
             task_id=line.task_id,
             created_at=line.created_at,
+            images=list(line.images),
         )
         for line in lines
     ]
@@ -298,7 +329,17 @@ async def _chat_state(
                 task_id = recent[0].id
             else:
                 status = "idle"
-    return ChatState(status=status, task_id=task_id, messages=messages)
+    return ChatState(status=status, mode=agent.mode, task_id=task_id, messages=messages)
+
+
+def _instruction_text(message: str, manual: bool) -> str:
+    """Manual mode keeps the chat text, including code. Auto mode can expand a skill."""
+
+    if manual:
+        return message or "Use the attached picture."
+    if not message:
+        return "Use the attached picture."
+    return expand_prompt(message)
 
 
 def _saved_paths(text: str) -> list[str]:

@@ -40,15 +40,35 @@ Use the persistent Chromium profile. Do not ask for, type, or store passwords.
 Do not delete files, send messages or email, make purchases or payments,
 change passwords, or install software. If a task needs one of those, stop and
 say that it is blocked.
+For a Playwright-based browser agent, I recommend this workflow:
+1. Detect whether another browser page or popup opened.
+2. Determine which page is active.
+3. Identify whether the interface uses an iframe or modal.
+4. Capture a fresh screenshot of the correct browser context.
+5. Use Playwright locators rather than screen coordinates whenever possible.
+6. Resume automation when verification succeeds.
 Pass action arguments as objects.
 Navigate: {"navigate": {"url": "https://example.com"}}.
 Type into an element with the field name text, never value:
 {"input": {"index": 2, "text": "Ethereum price"}}.
-Click: {"click": {"index": 5}}.
+Click an element by index: {"click": {"index": 5}}.
+When the target sits inside a popup frame or image, click its point: {"click": {"coordinate_x": 420, "coordinate_y": 310}}. The center of the popup frame is not the target.
 When you finish, the done action must include a short factual result.
 Do not close the browser. The user decides when it closes.
 A follow-up user request overrides the plan you were following.
+If the Chromium window is already open, do the new instruction on the page
+that is showing. Do not open another window, and do not leave that page
+unless the instruction asks for a different one.
 Standing instructions from a similar past situation also apply.
+""".strip()
+
+_MANUAL_EXTRA = """
+Manual mode. The user's latest message is the only instruction. It may be code or other text.
+Carry out that instruction exactly, then stop.
+Do not add steps, do not continue into later work, and do not apply standing instructions.
+If the instruction is a command or code to run on this computer, run it with local_shell and report the result.
+If it is a browser instruction, do that in the open browser and then stop.
+When the instruction is finished, the done action must include a short factual result.
 """.strip()
 
 
@@ -63,10 +83,13 @@ class Agent:
         self._active_task_id: int | None = None
         self._active_task_text = ""
         self._last_url = ""
-        self._inbox: list[str] = []
+        self._inbox: list[tuple[str, list[Any]]] = []
         self._browser: Any = None
         self._browser_agent: Any = None
         self._close_requested = False
+        self.mode = "auto"
+        self._turn_manual = False
+        self._turn_images: list[str] = []
 
     @property
     def is_running(self) -> bool:
@@ -112,35 +135,64 @@ class Agent:
         self._close_requested = False
         await _close_browser(browser)
 
-    def steer(self, text: str) -> None:
+    def set_mode(self, mode: str) -> None:
+        """Switch between autonomous work and one-instruction manual work."""
+
+        if mode in {"auto", "manual"}:
+            self.mode = mode
+
+    def arm_turn(self, *, manual: bool, image_urls: list[str]) -> None:
+        """Remember how the next task should treat the user's instruction."""
+
+        self._turn_manual = manual
+        self._turn_images = list(image_urls)
+
+    def steer(self, text: str, image_urls: list[str] | None = None) -> None:
         """Queue an instruction for the running browser task."""
 
         cleaned = text.strip()
-        if cleaned:
-            self._inbox.append(cleaned)
+        pictures = list(image_urls or [])
+        if cleaned or pictures:
+            self._inbox.append((cleaned, pictures))
 
     async def execute(self, task_id: int) -> None:
         """Run the stored task until it completes, fails, or is blocked."""
 
         record = await self.memory.get_task(task_id)
         if record is None:
+            self._turn_manual = False
+            self._turn_images = []
             logger.error("Task %s disappeared before it could run.", task_id)
             return
 
+        manual = self._turn_manual
+        image_urls = self._turn_images
+        self._turn_manual = False
+        self._turn_images = []
         self._block_reason = None
         self._running = True
         self._active_task_id = task_id
         self._active_task_text = record.task
-        self._last_url = ""
-        previous = await self.memory.recent_context(exclude_id=task_id)
-        guidance = await self.memory.relevant_instructions(record.task)
-        prompt = _with_memory(record.task, previous, guidance)
+        if manual:
+            prompt = record.task
+        else:
+            previous = await self.memory.recent_context(exclude_id=task_id)
+            guidance = await self.memory.relevant_instructions(record.task)
+            prompt = _with_memory(record.task, previous, guidance)
         reused = self._browser is not None
+        current_url = self._last_url
         if reused:
+            showing = f" The page on screen is {current_url}." if current_url else ""
             prompt = (
-                "The Chromium window is already open. Continue from the current page. "
-                "Do not close the browser.\n\n" + prompt
+                "The Chromium window is already open. Work in that window, "
+                "on the page that is showing now."
+                f"{showing} "
+                "Do not open a new window. Do not navigate away unless this "
+                "instruction asks for a different page. Do not close the browser.\n\n"
+                + prompt
             )
+        else:
+            self._last_url = ""
         await self.memory.add_action(task_id, "start", record.task, {"step": 0})
         await self.memory.add_chat("agent", "Working on it.", task_id)
 
@@ -167,6 +219,9 @@ class Agent:
                 tools=tools,
                 settings=self.settings,
                 on_step=on_step,
+                directly_open_url=not reused,
+                system_extra=_system_extra(manual),
+                sample_images=_image_parts(image_urls),
             )
             holder["agent"] = browser_agent
             self._browser_agent = browser_agent
@@ -252,7 +307,7 @@ class Agent:
         if goal:
             await self.memory.add_chat("agent", goal, task_id)
 
-    def _drain(self) -> list[str]:
+    def _drain(self) -> list[tuple[str, list[str]]]:
         if not self._inbox:
             return []
         notes = self._inbox
@@ -270,16 +325,55 @@ class Agent:
         notes = self._drain()
         if not notes:
             return False
-        _inject_instruction(browser_agent, notes)
+        texts = [text for text, _images in notes if text]
+        pictures: list[str] = []
+        for _text, images in notes:
+            pictures.extend(images)
+        manual = self.mode == "manual"
+        _attach_images(browser_agent, _image_parts(pictures))
+        _inject_instruction(browser_agent, texts or ["Use the attached picture."], manual)
         if model_output is not None and getattr(model_output, "action", None):
             # The model chose this action before it saw the new instruction.
             model_output.action = []
-        text = "Following your instruction: " + " | ".join(notes)
+        shown = texts or ["the attached picture"]
+        text = "Following your instruction: " + " | ".join(shown)
         await self.memory.add_chat("agent", text, task_id)
         return True
 
 
-def _inject_instruction(browser_agent: Any, notes: list[str]) -> None:
+def _system_extra(manual: bool) -> str:
+    """Safety and workflow text. Manual mode keeps the agent on one instruction."""
+
+    if not manual:
+        return _SYSTEM_EXTRA
+    base = _SYSTEM_EXTRA.replace(
+        "Standing instructions from a similar past situation also apply.",
+        "Standing instructions do not apply. Do only the user's latest instruction.",
+    )
+    return base + "\n" + _MANUAL_EXTRA
+
+
+def _image_parts(data_urls: list[str]) -> list[Any] | None:
+    if not data_urls:
+        return None
+    from app.chat_images import content_parts
+
+    parts = content_parts(data_urls)
+    return parts or None
+
+
+def _attach_images(browser_agent: Any, parts: list[Any] | None) -> None:
+    """Show the user's picture on the next model step."""
+
+    if browser_agent is None or not parts:
+        return
+    browser_agent.sample_images = parts
+    manager = getattr(browser_agent, "_message_manager", None)
+    if manager is not None:
+        manager.sample_images = parts
+
+
+def _inject_instruction(browser_agent: Any, notes: list[str], manual: bool = False) -> None:
     """Append a follow-up to the running Browser Use conversation."""
 
     if browser_agent is None:
@@ -288,9 +382,15 @@ def _inject_instruction(browser_agent: Any, notes: list[str]) -> None:
     if manager is None or not hasattr(manager, "add_new_task"):
         logger.warning("The running agent cannot accept a follow-up instruction.")
         return
-    body = "Follow this instruction now. It overrides the previous plan:\n" + "\n".join(
-        f"- {note}" for note in notes
-    )
+    if manual:
+        body = (
+            "Manual mode. This is the only instruction. Carry it out and then stop:\n"
+            + "\n".join(notes)
+        )
+    else:
+        body = "Follow this instruction now. It overrides the previous plan:\n" + "\n".join(
+            f"- {note}" for note in notes
+        )
     manager.add_new_task(body)
 
 
@@ -379,19 +479,27 @@ async def _save_screenshot(directory: Path, task_id: int, step: int, browser_sta
 
 
 def _prepare_kept_browser(browser: Any) -> None:
-    """Give a kept-open Chromium a live event bus for the next task.
+    """Let the next command use the Chromium window that is already open.
 
-    Browser Use stops that bus when a task ends, even when the window stays open.
+    Browser Use stops the event bus when a task ends, but the window, the page,
+    and the click handlers stay. Restart that same bus. A replacement bus has
+    no handlers, so the next command cannot see the page.
     """
 
     bus = getattr(browser, "event_bus", None)
-    if bus is not None and getattr(bus, "event_queue", None) is not None:
+    if bus is None:
         return
-    from bubus import EventBus
-
-    browser.event_bus = EventBus(name="browser-kept-open")
-    if hasattr(browser, "_watchdogs_attached"):
-        browser._watchdogs_attached = False
+    queue = getattr(bus, "event_queue", None)
+    running = bool(getattr(bus, "_is_running", False))
+    shutdown = bool(getattr(queue, "_is_shutdown", False)) if queue is not None else True
+    if running and not shutdown:
+        return
+    bus.event_queue = None
+    bus._on_idle = None
+    bus._is_running = False
+    bus._runloop_task = None
+    if hasattr(browser, "_intentional_stop"):
+        browser._intentional_stop = False
 
 
 async def _close_browser(browser: Any) -> None:
@@ -417,6 +525,9 @@ def _construct_browser_agent(
     tools: Any,
     settings: Settings,
     on_step: Any,
+    directly_open_url: bool = True,
+    system_extra: str | None = None,
+    sample_images: list[Any] | None = None,
 ) -> Any:
     """Build a Browser Use agent, dropping kwargs unknown to older releases."""
 
@@ -432,7 +543,7 @@ def _construct_browser_agent(
         "tools": tools,
         "use_vision": settings.vision_mode(),
         "use_thinking": settings.use_thinking,
-        "extend_system_message": _SYSTEM_EXTRA,
+        "extend_system_message": system_extra or _SYSTEM_EXTRA,
         "register_new_step_callback": on_step,
         "max_failures": 3,
         "max_actions_per_step": 3,
@@ -444,8 +555,11 @@ def _construct_browser_agent(
         "calculate_cost": False,
         "include_tool_call_examples": True,
         "max_history_items": 8,
+        "directly_open_url": directly_open_url,
         "file_system_path": str(settings.logs_path / "agent-files"),
     }
+    if sample_images:
+        kwargs["sample_images"] = sample_images
     if tools is None:
         kwargs.pop("tools")
     try:
@@ -463,10 +577,32 @@ def _construct_browser_agent(
                 "extend_system_message",
                 "register_new_step_callback",
                 "max_failures",
+                "directly_open_url",
             )
             if key in kwargs
         }
         return BrowserUseAgent(**core)
+
+
+def _prefer_click_coordinates(tools: Any) -> None:
+    """Use a supplied point when a click also names an element.
+
+    The point is where the button is. The element index is often the popup frame.
+    """
+
+    original = getattr(tools, "_click_by_index", None)
+    coordinate = getattr(tools, "_click_by_coordinate", None)
+    if original is None or coordinate is None:
+        return
+
+    async def _click_by_index(params: Any, browser_session: Any) -> Any:
+        if getattr(params, "coordinate_x", None) is not None and getattr(
+            params, "coordinate_y", None
+        ) is not None:
+            return await coordinate(params, browser_session)
+        return await original(params, browser_session)
+
+    tools._click_by_index = _click_by_index
 
 
 def _build_tools(settings: Settings) -> Any | None:
@@ -483,6 +619,9 @@ def _build_tools(settings: Settings) -> Any | None:
             return None
 
     tools = Tools()
+    if hasattr(tools, "set_coordinate_clicking"):
+        tools.set_coordinate_clicking(True)
+    _prefer_click_coordinates(tools)
     root = PROJECT_ROOT
 
     @tools.action(

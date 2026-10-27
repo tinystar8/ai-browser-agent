@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -78,7 +80,9 @@ class ShellRequest(BaseModel):
 class ChatRequest(BaseModel):
     """Body of POST /chat."""
 
-    message: str = Field(min_length=1, max_length=16000)
+    message: str = Field(default="", max_length=16000)
+    mode: Literal["auto", "manual"] | None = None
+    images: list[str] = Field(default_factory=list, max_length=4)
 
 
 class ChatMessage(BaseModel):
@@ -89,12 +93,14 @@ class ChatMessage(BaseModel):
     text: str
     task_id: int | None = None
     created_at: str
+    images: list[str] = Field(default_factory=list)
 
 
 class ChatState(BaseModel):
     """What the chat page polls, and the reply to a sent message."""
 
     status: str
+    mode: Literal["auto", "manual"] = "auto"
     task_id: int | None = None
     reply: str | None = None
     saved: list[str] = Field(default_factory=list)

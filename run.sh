@@ -41,7 +41,7 @@ read_env() {
 }
 
 HOST_VALUE="$(read_env HOST 0.0.0.0)"
-PORT_VALUE="$(read_env PORT 8000)"
+PORT_VALUE="$(read_env PORT 7000)"
 
 echo "Starting AI browser agent on http://${HOST_VALUE}:${PORT_VALUE}"
 exec python -m uvicorn app.main:app --host "$HOST_VALUE" --port "$PORT_VALUE"

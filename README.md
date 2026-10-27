@@ -146,7 +146,9 @@ Stop the server with Ctrl+C while no task is running. During a task, Browser Use
 
 Start `./run.sh`, then open [http://127.0.0.1:8000/](http://127.0.0.1:8000/).
 
-Type a sentence and press Send. If nothing is running, that starts a task. If a task is already running, the message is given to the agent before its next click, and the click it had already chosen is skipped.
+Type a sentence and press Send. Shift+Enter adds a line, so the instruction can be code or other text. Picture attaches a PNG, JPEG, GIF, or WebP, and that picture is sent with the message.
+
+Auto mode is the normal agent: it plans the work, and a message sent during a run is given to the agent before its next click. Manual mode does only the instruction in the chat box, then stops. A message sent during a run still replaces the click the agent had already chosen.
 
 When the task finishes, Chromium stays open. The chat asks you before closing it. Send the next instruction to continue in the same window, or send `close` to close it.
 

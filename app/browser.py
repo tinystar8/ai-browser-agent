@@ -15,7 +15,10 @@ from app.config import Settings, get_settings
 def build_browser(settings: Settings | None = None) -> Any:
     """Launch a local Chromium session through Playwright."""
 
+    from app.popup_clicks import install_popup_clicks
     from browser_use import Browser
+
+    install_popup_clicks()
 
     cfg = settings or get_settings()
     cfg.profile_path.mkdir(parents=True, exist_ok=True)
