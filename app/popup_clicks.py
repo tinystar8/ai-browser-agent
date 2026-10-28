@@ -273,7 +273,9 @@ def install_popup_clicks() -> None:
     _INSTALLED = True
 
 
-async def click_visible_layer(watchdog: Any, session: Any, x: float, y: float) -> dict[str, float]:
+async def click_visible_layer(
+    watchdog: Any, session: Any, x: float, y: float, button: str = "left"
+) -> dict[str, float]:
     """Click the painted layer at ``x, y``, stepping into frames that cover the page."""
 
     browser = watchdog.browser_session
@@ -291,7 +293,19 @@ async def click_visible_layer(watchdog: Any, session: Any, x: float, y: float) -
     if aimed is not None:
         x, y = aimed
         logger.info("Clicking the button inside the popup.")
-    return await _dispatch_click(session, x, y)
+    return await _dispatch_click(session, x, y, button)
+
+
+async def right_click_point(browser_session: Any, x: float, y: float) -> dict[str, float]:
+    """Right-click a viewport point, including a button inside a popup frame."""
+
+    session = await browser_session.get_or_create_cdp_session()
+    info = await _point_info(session, x, y)
+    top = str((info or {}).get("tag") or "")
+    if top in {"IFRAME", "FRAME"}:
+        holder = type("_Watch", (), {"browser_session": browser_session})()
+        return await click_visible_layer(holder, session, x, y, button="right")
+    return await _dispatch_click(session, x, y, button="right")
 
 
 async def _point_info(session: Any, x: float, y: float) -> dict[str, Any] | None:
@@ -415,9 +429,13 @@ def _matching_frame_id(frames: dict[str, dict[str, Any]], src: str) -> str | Non
     return best_id
 
 
-async def _dispatch_click(session: Any, x: float, y: float) -> dict[str, float]:
+_MOUSE_BUTTONS = {"left": 1, "right": 2, "middle": 4}
+
+
+async def _dispatch_click(session: Any, x: float, y: float, button: str = "left") -> dict[str, float]:
     client = session.cdp_client
     session_id = session.session_id
+    button_name = button if button in _MOUSE_BUTTONS else "left"
     point = {"x": float(x), "y": float(y)}
     await client.send.Input.dispatchMouseEvent(
         params={"type": "mouseMoved", "pointerType": "mouse", **point},
@@ -427,8 +445,8 @@ async def _dispatch_click(session: Any, x: float, y: float) -> dict[str, float]:
     await client.send.Input.dispatchMouseEvent(
         params={
             "type": "mousePressed",
-            "button": "left",
-            "buttons": 1,
+            "button": button_name,
+            "buttons": _MOUSE_BUTTONS[button_name],
             "clickCount": 1,
             "pointerType": "mouse",
             **point,
@@ -439,7 +457,7 @@ async def _dispatch_click(session: Any, x: float, y: float) -> dict[str, float]:
     await client.send.Input.dispatchMouseEvent(
         params={
             "type": "mouseReleased",
-            "button": "left",
+            "button": button_name,
             "buttons": 0,
             "clickCount": 1,
             "pointerType": "mouse",

@@ -26,6 +26,17 @@ class SkillView(BaseModel):
     args: list[str] = Field(default_factory=list)
 
 
+class SkillDocument(BaseModel):
+    """The editable text of one skill file."""
+
+    name: str = Field(min_length=1, max_length=48)
+    description: str = Field(default="", max_length=300)
+    args: list[str] = Field(default_factory=list)
+    validate: str = Field(default="", max_length=200)
+    fetch: str = Field(default="", max_length=32)
+    body: str = Field(default="", max_length=16000)
+
+
 class TaskCreateResponse(BaseModel):
     """Acknowledgement that a task was stored and either started or refused."""
 
@@ -105,6 +116,8 @@ class ChatState(BaseModel):
     reply: str | None = None
     saved: list[str] = Field(default_factory=list)
     messages: list[ChatMessage] = Field(default_factory=list)
+    skills: list[SkillView] = Field(default_factory=list)
+    commands: str | None = None
 
 
 class ShellResponse(BaseModel):

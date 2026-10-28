@@ -148,7 +148,7 @@ Start `./run.sh`, then open [http://127.0.0.1:8000/](http://127.0.0.1:8000/).
 
 Type a sentence and press Send. Shift+Enter adds a line, so the instruction can be code or other text. Picture attaches a PNG, JPEG, GIF, or WebP, and that picture is sent with the message.
 
-Auto mode is the normal agent: it plans the work, and a message sent during a run is given to the agent before its next click. Manual mode does only the instruction in the chat box, then stops. A message sent during a run still replaces the click the agent had already chosen.
+Auto mode is the normal agent: it plans the work, and a message sent during a run is given to the agent before its next click. Manual mode shows the commands you can send, does that one command, then stops. A question about the screen, such as “Tell me the coordinate of the first blue bottle,” is answered from the open page or an attached picture. A message sent during a run still replaces the click the agent had already chosen.
 
 When the task finishes, Chromium stays open. The chat asks you before closing it. Send the next instruction to continue in the same window, or send `close` to close it.
 
@@ -198,6 +198,8 @@ Then run:
 ```
 
 `args` is a comma-separated list when a skill needs more than one value. `validate: address=ethereum` checks that an argument is a 0x address. No other code change is required. Restart `./run.sh` after adding a file so the API reloads it. `./prompt` reads the folder on each run.
+
+In the chat window, each skill is a button under the status line. Click it to read the prompt and save edits. After a task finishes, send `Add skill` to save that task as a new skill. The prompt lists the URLs and controls from the run, and it stops before a blocked step. Clicking Add skill again updates that same skill. `Add skill my-name` chooses a new name. One Ethereum address in the task becomes `{address}`, so the next run can take a different address.
 
 ## API
 

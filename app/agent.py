@@ -53,6 +53,7 @@ Type into an element with the field name text, never value:
 {"input": {"index": 2, "text": "Ethereum price"}}.
 Click an element by index: {"click": {"index": 5}}.
 When the target sits inside a popup frame or image, click its point: {"click": {"coordinate_x": 420, "coordinate_y": 310}}. The center of the popup frame is not the target.
+Right-click the same way: {"right_click": {"coordinate_x": 420, "coordinate_y": 310}} or {"right_click": {"index": 5}}.
 When you finish, the done action must include a short factual result.
 Do not close the browser. The user decides when it closes.
 A follow-up user request overrides the plan you were following.
@@ -66,8 +67,15 @@ _MANUAL_EXTRA = """
 Manual mode. The user's latest message is the only instruction. It may be code or other text.
 Carry out that instruction exactly, then stop.
 Do not add steps, do not continue into later work, and do not apply standing instructions.
-If the instruction is a command or code to run on this computer, run it with local_shell and report the result.
-If it is a browser instruction, do that in the open browser and then stop.
+Map one command onto one action, then stop.
+click X Y means {"click": {"coordinate_x": X, "coordinate_y": Y}}.
+right click X Y means {"right_click": {"coordinate_x": X, "coordinate_y": Y}}.
+click index N means {"click": {"index": N}}.
+right click index N means {"right_click": {"index": N}}.
+press Escape means {"send_keys": {"keys": "Escape"}}.
+open URL means {"navigate": {"url": "URL"}}.
+scroll down means {"scroll": {"down": true, "pages": 1}}.
+If the instruction is code to run on this computer, run it with local_shell and report the result.
 When the instruction is finished, the done action must include a short factual result.
 """.strip()
 
@@ -125,6 +133,29 @@ class Agent:
         active = self._browser_agent
         if self._running and active is not None and hasattr(active, "stop"):
             active.stop()
+
+    async def page_png(self) -> bytes | None:
+        """Capture the open page. Returns None when the browser is closed or capture fails."""
+
+        browser = self._browser
+        if browser is None:
+            return None
+        try:
+            session = await browser.get_or_create_cdp_session()
+            result = await session.cdp_client.send.Page.captureScreenshot(
+                params={"format": "png"},
+                session_id=session.session_id,
+            )
+        except Exception:
+            logger.debug("Could not capture the open page.", exc_info=True)
+            return None
+        data = result.get("data") if isinstance(result, dict) else None
+        if not data:
+            return None
+        try:
+            return base64.b64decode(data)
+        except Exception:
+            return None
 
     async def close_browser(self) -> None:
         """Close Chromium. Safe to call when it is already closed."""
@@ -605,6 +636,62 @@ def _prefer_click_coordinates(tools: Any) -> None:
     tools._click_by_index = _click_by_index
 
 
+def _viewport_point(browser_session: Any, x: int, y: int) -> tuple[int, int]:
+    """Match a left click when the model sees a resized screenshot."""
+
+    llm_size = getattr(browser_session, "llm_screenshot_size", None)
+    original = getattr(browser_session, "_original_viewport_size", None)
+    if not llm_size or not original:
+        return x, y
+    original_width, original_height = original
+    llm_width, llm_height = llm_size
+    if not llm_width or not llm_height:
+        return x, y
+    return int((x / llm_width) * original_width), int((y / llm_height) * original_height)
+
+
+def _register_right_click(tools: Any) -> None:
+    """Add a right-click action. Browser Use only ships a left click."""
+
+    from browser_use.agent.views import ActionResult
+
+    from app.popup_clicks import _POPUP_CENTER_MESSAGE, right_click_point
+
+    @tools.action(
+        "Right-click an element by index, or a point with coordinate_x and coordinate_y. "
+        "Use a point when the target sits inside a popup. This opens the context menu."
+    )
+    async def right_click(
+        browser_session,
+        index: int | None = None,
+        coordinate_x: int | None = None,
+        coordinate_y: int | None = None,
+    ) -> Any:
+        if coordinate_x is not None and coordinate_y is not None:
+            actual_x, actual_y = _viewport_point(browser_session, coordinate_x, coordinate_y)
+            point = await right_click_point(browser_session, actual_x, actual_y)
+            return ActionResult(
+                extracted_content=f"Right-clicked at {coordinate_x}, {coordinate_y}.",
+                metadata=point,
+            )
+        if index is None:
+            return ActionResult(error="Provide an index, or both coordinate_x and coordinate_y.")
+        node = await browser_session.get_element_by_index(index)
+        if node is None:
+            return ActionResult(error=f"Element index {index} is not on the page.")
+        tag = str(getattr(node, "tag_name", "") or "").lower()
+        if tag in {"iframe", "frame"}:
+            return ActionResult(error=_POPUP_CENTER_MESSAGE)
+        session = await browser_session.cdp_client_for_node(node)
+        rect = await browser_session.get_element_coordinates(node.backend_node_id, session)
+        if rect is None or rect.width <= 0 or rect.height <= 0:
+            return ActionResult(error=f"Could not locate element index {index}.")
+        point = await right_click_point(
+            browser_session, rect.x + rect.width / 2, rect.y + rect.height / 2
+        )
+        return ActionResult(extracted_content=f"Right-clicked element {index}.", metadata=point)
+
+
 def _build_tools(settings: Settings) -> Any | None:
     """Register the read-only file tool and the allowlisted shell tool."""
 
@@ -622,6 +709,7 @@ def _build_tools(settings: Settings) -> Any | None:
     if hasattr(tools, "set_coordinate_clicking"):
         tools.set_coordinate_clicking(True)
     _prefer_click_coordinates(tools)
+    _register_right_click(tools)
     root = PROJECT_ROOT
 
     @tools.action(

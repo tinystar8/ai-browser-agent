@@ -12,6 +12,7 @@ from app.popup_clicks import (
     install_popup_clicks,
     is_popup_center_click,
     pick_control,
+    right_click_point,
     should_click_front_layer,
 )
 
@@ -164,6 +165,18 @@ class PopupClickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event["type"] for event in popup.events], ["mouseMoved", "mousePressed", "mouseReleased"])
         self.assertEqual(popup.events[-1]["x"], 40.0)
         self.assertEqual(popup.events[-1]["y"], 70.0)
+        self.assertEqual(popup.events[1]["button"], "left")
+
+    async def test_right_click_uses_the_right_button(self) -> None:
+        page = Session("page", {"tag": "BUTTON", "frame": False})
+        browser = Browser({"page": page})
+
+        await right_click_point(browser, 120, 80)
+
+        pressed = page.events[1]
+        self.assertEqual(pressed["type"], "mousePressed")
+        self.assertEqual(pressed["button"], "right")
+        self.assertEqual(pressed["buttons"], 2)
 
     async def test_element_click_uses_the_popup_when_it_covers_the_page(self) -> None:
         from browser_use.browser.watchdogs.default_action_watchdog import DefaultActionWatchdog

@@ -34,6 +34,93 @@ def build_langchain_llm(settings: Settings | None = None) -> ChatOpenAI:
     )
 
 
+_ANSWER_SYSTEM = """
+Answer the user's question about the attached screenshot.
+When they ask for a coordinate, measure it on a 1000 by 1000 grid.
+coordinate_x runs from the left edge (0) to the right edge (1000).
+coordinate_y runs from the top edge (0) to the bottom edge (1000).
+Write the point as coordinate_x=<number>, coordinate_y=<number>.
+If several objects match, use the first one in reading order, left to right then top to bottom.
+Name the object and the point. Do not invent a point you cannot see.
+Do not return a browser action.
+""".strip()
+
+_GRID_POINT = re.compile(
+    r"coordinate_x\s*[:=]\s*(\d+(?:\.\d+)?)\s*,?\s*coordinate_y\s*[:=]\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def grid_to_page(x: float, y: float, width: int, height: int) -> tuple[int, int]:
+    """Map a 0–1000 model point onto page pixels. 1000 is the far edge."""
+
+    return round(x / 1000 * width), round(y / 1000 * height)
+
+
+def rewrite_grid_coordinates(text: str, width: int, height: int) -> str:
+    """Replace the model's 0–1000 point with the page pixels a click uses."""
+
+    if width <= 0 or height <= 0:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        page_x, page_y = grid_to_page(float(match.group(1)), float(match.group(2)), width, height)
+        return f"coordinate_x={page_x}, coordinate_y={page_y}"
+
+    rewritten, count = _GRID_POINT.subn(replace, text)
+    if count == 0:
+        return text
+    first = _GRID_POINT.search(rewritten)
+    if first is None:
+        return rewritten
+    return f"{rewritten.rstrip()}\nclick {first.group(1)} {first.group(2)}"
+
+
+def _image_size(data_url: str) -> tuple[int, int] | None:
+    """Width and height of a data URL, in pixels."""
+
+    import base64
+    import io
+
+    raw = data_url.split(",", 1)[-1]
+    try:
+        blob = base64.b64decode(raw, validate=False)
+    except Exception:
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(blob)) as image:
+            width, height = image.size
+    except Exception:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+async def answer_about_image(
+    question: str, data_urls: list[str], settings: Settings | None = None
+) -> str:
+    """Ask the local model about a screenshot and return page-pixel coordinates."""
+
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    content: list[dict[str, object]] = [{"type": "text", "text": question}]
+    for url in data_urls[:2]:
+        content.append({"type": "image_url", "image_url": {"url": url}})
+    response = await build_langchain_llm(settings).ainvoke(
+        [SystemMessage(content=_ANSWER_SYSTEM), HumanMessage(content=content)]
+    )
+    text = _THINK_BLOCK.sub("", _message_text(getattr(response, "content", response))).strip()
+    if not text:
+        return "I could not see an answer in the picture."
+    size = _image_size(data_urls[0]) if data_urls else None
+    if size is None:
+        return text
+    return rewrite_grid_coordinates(text, size[0], size[1])
+
+
 def build_agent_llm(settings: Settings | None = None) -> LocalOllamaChat:
     """Return the Browser Use model wrapper around the LangChain client."""
 

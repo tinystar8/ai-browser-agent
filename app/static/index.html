@@ -31,7 +31,42 @@
       background: #f2f2f2;
       color: #141414;
     }
-    #status { color: #a3a3a3; font-family: ui-sans-serif, sans-serif; font-size: 14px; }
+    #status, #skills, #commands { color: #a3a3a3; font-family: ui-sans-serif, sans-serif; font-size: 14px; }
+    #commands {
+      margin: 8px 0 0;
+      white-space: pre-wrap;
+      max-height: 9em;
+      overflow: auto;
+    }
+    #commands[hidden] { display: none; }
+    #skills { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; }
+    #skills button {
+      padding: 6px 10px;
+      background: #242424;
+      color: #f2f2f2;
+      font-weight: 500;
+    }
+    #editor {
+      flex: none;
+      max-height: 48vh;
+      overflow: auto;
+      padding: 12px 20px 16px;
+      border-bottom: 1px solid #2a2a2a;
+      background: #101010;
+    }
+    #editor[hidden] { display: none; }
+    #editor h2 { margin: 0 0 8px; font-size: 16px; }
+    #editor label {
+      display: block;
+      margin: 8px 0 4px;
+      color: #a3a3a3;
+      font-family: ui-sans-serif, sans-serif;
+      font-size: 13px;
+    }
+    #editor input, #editor textarea { width: 100%; box-sizing: border-box; }
+    #editor textarea { min-height: 140px; }
+    #editor .actions { display: flex; gap: 8px; margin-top: 10px; }
+    #skill-note { color: #86efac; font-family: ui-sans-serif, sans-serif; font-size: 13px; }
     #log {
       flex: 1;
       min-height: 0;
@@ -117,9 +152,31 @@
     <div id="modes">
       <button type="button" data-mode="auto" class="selected">Auto</button>
       <button type="button" data-mode="manual">Manual</button>
+      <button type="button" id="add-skill">Add skill</button>
     </div>
     <div id="status">Checking the agent…</div>
+    <pre id="commands" hidden></pre>
+    <div id="skills">Skills load with the chat.</div>
   </header>
+  <section id="editor" hidden>
+    <h2>Edit skill</h2>
+    <input id="skill-current" type="hidden">
+    <input id="skill-validate" type="hidden">
+    <input id="skill-fetch" type="hidden">
+    <label for="skill-name">Name</label>
+    <input id="skill-name" autocomplete="off">
+    <label for="skill-description">Description</label>
+    <input id="skill-description" autocomplete="off">
+    <label for="skill-args">Arguments, separated by commas. Use {argument} in the prompt.</label>
+    <input id="skill-args" autocomplete="off">
+    <label for="skill-body">Prompt</label>
+    <textarea id="skill-body" rows="8"></textarea>
+    <div class="actions">
+      <button type="button" id="skill-save">Save</button>
+      <button type="button" id="skill-close">Close</button>
+      <span id="skill-note"></span>
+    </div>
+  </section>
   <div id="log"></div>
   <form id="form">
     <div id="previews"></div>
@@ -137,10 +194,11 @@
     const text = document.querySelector("#text");
     const file = document.querySelector("#file");
     const previews = document.querySelector("#previews");
-    const modeButtons = document.querySelectorAll("#modes button");
+    const modeButtons = document.querySelectorAll("#modes button[data-mode]");
     let lastId = 0;
     let stickToBottom = true;
     let mode = "auto";
+    let skillKeyShown = "";
     const pictures = [];
 
     function atBottom() {
@@ -167,6 +225,49 @@
       log.appendChild(row);
     }
 
+    function showSkills(skills) {
+      const key = skills.map((skill) => skill.name + (skill.description || "")).join("|");
+      const box = document.querySelector("#skills");
+      if (key === skillKeyShown && box.querySelector("button")) return;
+      skillKeyShown = key;
+      box.replaceChildren();
+      if (!skills.length) {
+        box.textContent = "No skills yet. Finish a task, then send Add skill.";
+        return;
+      }
+      const label = document.createElement("span");
+      label.textContent = "Skills";
+      box.appendChild(label);
+      for (const skill of skills) {
+        const button = document.createElement("button");
+        button.type = "button";
+        const args = skill.args && skill.args.length ? " " + skill.args.join(" ") : "";
+        button.textContent = skill.name + args;
+        button.title = skill.description || skill.name;
+        button.addEventListener("click", () => openSkill(skill.name));
+        box.appendChild(button);
+      }
+    }
+
+    async function openSkill(name) {
+      const response = await fetch("/skills/" + encodeURIComponent(name));
+      if (!response.ok) {
+        document.querySelector("#skill-note").textContent = "That skill could not be opened.";
+        return;
+      }
+      const skill = await response.json();
+      document.querySelector("#editor").hidden = false;
+      document.querySelector("#skill-current").value = skill.name;
+      document.querySelector("#skill-name").value = skill.name;
+      document.querySelector("#skill-description").value = skill.description || "";
+      document.querySelector("#skill-args").value = (skill.args || []).join(", ");
+      document.querySelector("#skill-validate").value = skill.validate || "";
+      document.querySelector("#skill-fetch").value = skill.fetch || "";
+      document.querySelector("#skill-body").value = skill.body || "";
+      document.querySelector("#skill-note").textContent = "";
+      document.querySelector("#skill-body").focus();
+    }
+
     function showMode(next) {
       mode = next === "manual" ? "manual" : "auto";
       for (const button of modeButtons) {
@@ -175,7 +276,7 @@
     }
 
     function placeholder(data) {
-      if (mode === "manual") return "One instruction. Code or other text. Shift+Enter adds a line.";
+      if (mode === "manual") return "A command, or a question about the screen. Shift+Enter adds a line.";
       if (data.status === "waiting") return "Command the open window. Say close to close it.";
       if (data.status === "running" || data.status === "steering") return "The running task follows this next.";
       return "Tell the agent what to do. Shift+Enter adds a line.";
@@ -192,6 +293,14 @@
             ? "Idle. A message starts a task."
             : "Last task " + (data.task_id ?? "") + " is " + data.status;
       status.textContent = prefix + label.trim();
+      const commands = document.querySelector("#commands");
+      if (data.mode === "manual" && data.commands) {
+        commands.hidden = false;
+        commands.textContent = data.commands;
+      } else {
+        commands.hidden = true;
+      }
+      showSkills(data.skills || []);
       text.placeholder = placeholder(data);
       const follow = stickToBottom;
       for (const message of data.messages) {
@@ -248,6 +357,48 @@
         };
         reader.readAsDataURL(item);
       }
+    });
+
+    document.querySelector("#skill-close").addEventListener("click", () => {
+      document.querySelector("#editor").hidden = true;
+      document.querySelector("#skill-note").textContent = "";
+    });
+
+    document.querySelector("#skill-save").addEventListener("click", async () => {
+      const current = document.querySelector("#skill-current").value;
+      const note = document.querySelector("#skill-note");
+      const payload = {
+        name: document.querySelector("#skill-name").value.trim(),
+        description: document.querySelector("#skill-description").value,
+        args: document.querySelector("#skill-args").value.split(",").map((item) => item.trim()).filter(Boolean),
+        validate: document.querySelector("#skill-validate").value.trim(),
+        fetch: document.querySelector("#skill-fetch").value.trim(),
+        body: document.querySelector("#skill-body").value,
+      };
+      const response = await fetch("/skills/" + encodeURIComponent(current), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({}));
+        note.textContent = detail.detail || "The skill could not be saved.";
+        return;
+      }
+      const saved = await response.json();
+      document.querySelector("#skill-current").value = saved.name;
+      note.textContent = "Saved " + saved.name + ".";
+      refresh();
+    });
+
+    document.querySelector("#add-skill").addEventListener("click", async () => {
+      stickToBottom = true;
+      const response = await fetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: "Add skill", mode }),
+      });
+      if (response.ok) paint(await response.json());
     });
 
     for (const button of modeButtons) {

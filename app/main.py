@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -16,6 +17,8 @@ from fastapi.responses import FileResponse, HTMLResponse
 from app.agent import Agent
 from app.chat_images import ChatImageError, image_file, save_chat_images
 from app.config import PROJECT_ROOT, Settings, get_settings
+from app.llm import answer_about_image
+from app.manual import MANUAL_COMMANDS, is_command_request, is_screen_question, latest_screenshot
 from app.memory import MemoryStore, utc_now
 from app.models import (
     ActionView,
@@ -25,6 +28,7 @@ from app.models import (
     ChatMessage,
     ChatRequest,
     ChatState,
+    SkillDocument,
     SkillView,
     TaskCreateRequest,
     TaskCreateResponse,
@@ -32,7 +36,16 @@ from app.models import (
     TaskSummary,
 )
 from app.safety import assess_task
-from app.skills import SkillError, expand_prompt, list_skills, render_skill
+from app.skills import (
+    SkillError,
+    add_skill_request,
+    expand_prompt,
+    get_skill,
+    list_skills,
+    render_skill,
+    replace_skill,
+    save_task_as_skill,
+)
 from app.tools.shell import execute as run_shell
 
 logger = logging.getLogger("ai_browser_agent")
@@ -107,6 +120,29 @@ async def post_chat(body: ChatRequest, request: Request) -> ChatState:
         state = await _chat_state(request, status="blocked")
         return state.model_copy(update={"reply": decision.reason})
 
+    requested_name = add_skill_request(message)
+    if requested_name is not None:
+        try:
+            recent = await memory.list_tasks(8)
+            records = []
+            for item in recent:
+                full = await memory.get_task(item.id)
+                if full is not None:
+                    records.append(full)
+            skill = save_task_as_skill(records, name=requested_name or None)
+        except SkillError as exc:
+            reply = str(exc)
+        else:
+            usage = skill.name if not skill.args else skill.name + " " + " ".join(skill.args)
+            origin = " from the recent browser steps" if "Follow these steps" in skill.body else ""
+            reply = (
+                f"Saved skill {skill.name}{origin} in skills/{skill.path.name}. "
+                f"In Auto mode, send: {usage}"
+            )
+        await memory.add_chat("agent", reply, agent.active_task_id)
+        state = await _chat_state(request)
+        return state.model_copy(update={"reply": reply})
+
     if message and agent.wants_close(message):
         if agent.is_running:
             agent.request_close()
@@ -127,6 +163,16 @@ async def post_chat(body: ChatRequest, request: Request) -> ChatState:
         return state.model_copy(update={"reply": reply})
 
     manual = agent.mode == "manual"
+    if manual and message and is_command_request(message):
+        await memory.add_chat("agent", MANUAL_COMMANDS, agent.active_task_id)
+        state = await _chat_state(request)
+        return state.model_copy(update={"reply": MANUAL_COMMANDS})
+    if manual and message and is_screen_question(message):
+        reply = await _answer_screen(request, message, data_urls)
+        await memory.add_chat("agent", reply, agent.active_task_id)
+        state = await _chat_state(request)
+        return state.model_copy(update={"reply": reply})
+
     async with request.app.state.submit_lock:
         if agent.is_running or await memory.has_active_task():
             if not manual:
@@ -223,6 +269,36 @@ async def skills() -> list[SkillView]:
         SkillView(name=skill.name, description=skill.description, args=list(skill.args))
         for skill in list_skills()
     ]
+
+
+@app.get("/skills/{name}", response_model=SkillDocument)
+async def read_skill(name: str) -> SkillDocument:
+    """Return one skill so the chat window can show and edit it."""
+
+    try:
+        skill = get_skill(name)
+    except SkillError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return _skill_document(skill)
+
+
+@app.put("/skills/{name}", response_model=SkillDocument)
+async def write_skill(name: str, body: SkillDocument) -> SkillDocument:
+    """Save edits to one skill file."""
+
+    try:
+        skill = replace_skill(
+            name,
+            name=body.name,
+            description=body.description,
+            args=body.args,
+            validate=body.validate,
+            fetch=body.fetch,
+            body=body.body,
+        )
+    except SkillError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _skill_document(skill)
 
 
 @app.get("/task/{task_id}", response_model=TaskStatusResponse)
@@ -329,7 +405,67 @@ async def _chat_state(
                 task_id = recent[0].id
             else:
                 status = "idle"
-    return ChatState(status=status, mode=agent.mode, task_id=task_id, messages=messages)
+    return ChatState(
+        status=status,
+        mode=agent.mode,
+        task_id=task_id,
+        messages=messages,
+        skills=_installed_skills(),
+        commands=MANUAL_COMMANDS if agent.mode == "manual" else None,
+    )
+
+
+def _skill_document(skill: object) -> SkillDocument:
+    checks = getattr(skill, "checks", {})
+    validate = ", ".join(f"{key}={value}" for key, value in checks.items())
+    return SkillDocument(
+        name=skill.name,
+        description=skill.description,
+        args=list(skill.args),
+        validate=validate,
+        fetch=skill.fetch,
+        body=skill.body,
+    )
+
+
+def _installed_skills() -> list[SkillView]:
+    """Skills shown in the chat window. A broken file does not blank the page."""
+
+    try:
+        installed = list_skills()
+    except SkillError:
+        return []
+    return [
+        SkillView(name=skill.name, description=skill.description, args=list(skill.args))
+        for skill in installed
+    ]
+
+
+async def _answer_screen(request: Request, question: str, data_urls: list[str]) -> str:
+    """Answer a manual-mode question from an attached picture or the open page."""
+
+    agent: Agent = request.app.state.agent
+    settings: Settings = request.app.state.settings
+    pictures = list(data_urls)
+    if not pictures:
+        live = await agent.page_png()
+        if live:
+            pictures.append("data:image/png;base64," + base64.b64encode(live).decode("ascii"))
+    if not pictures:
+        saved = latest_screenshot(settings.screenshots_path)
+        if saved is not None:
+            encoded = base64.b64encode(saved.read_bytes()).decode("ascii")
+            pictures.append("data:image/png;base64," + encoded)
+    if not pictures:
+        return (
+            "I need the page on screen or an attached picture. "
+            "Open the page, or add a picture, then ask again."
+        )
+    try:
+        return await answer_about_image(question, pictures, settings)
+    except Exception as exc:
+        logger.exception("Manual question failed")
+        return f"Could not answer: {exc}"
 
 
 def _instruction_text(message: str, manual: bool) -> str:
